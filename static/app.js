@@ -636,14 +636,27 @@ async function showConnect({ autoReopen = true } = {}) {
   }
 }
 
-function showTrustNotice() {
-  // On GitHub Pages the source lives at github.com/<user>/<repo>.
+// A fork on GitHub Pages links to its own repo, github.com/<user>/<repo>.
+function sourceUrl() {
   const user = location.hostname.endsWith(".github.io") && location.hostname.split(".")[0];
-  if (user) {
-    const repo = location.pathname.split("/").filter(Boolean)[0] || `${user}.github.io`;
-    $("#trust-source").href = `https://github.com/${user}/${repo}`;
-    $("#trust-source").hidden = $("#trust-source-sep").hidden = false;
-  }
+  if (!user) return $("#view-source").href;
+  const repo = location.pathname.split("/").filter(Boolean)[0] || `${user}.github.io`;
+  return `https://github.com/${user}/${repo}`;
+}
+
+// Only Chromium-based browsers implement navigator.userAgentData.
+function firefoxOrSafari() {
+  if (navigator.userAgentData) return null;
+  const ua = navigator.userAgent;
+  if (/Firefox\/|FxiOS\//.test(ua)) return "Firefox";
+  if (/Safari\//.test(ua) && !/Chrome\/|Chromium\/|CriOS\/|Edg/.test(ua)) return "Safari";
+  return null;
+}
+
+function showTrustNotice() {
+  const browser = firefoxOrSafari();
+  $("#trust-readonly-note").hidden = !browser;
+  $("#trust-browser").textContent = browser || "";
   $("#trust").showModal();
 }
 
@@ -662,6 +675,7 @@ $("#change-folder").addEventListener("click", () => {
 });
 
 async function init() {
+  $("#view-source").href = $("#trust-source").href = sourceUrl();
   const server = await connectServer();
   if (server) return start(server);
   showTrustNotice();

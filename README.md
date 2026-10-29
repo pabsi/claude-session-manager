@@ -105,7 +105,3 @@ keeps the pinned GitHub Actions up to date.
 
 `backend-browser.js` and `parser-worker.js` port `store.py` to the browser, so a change
 to how sessions are read must be made in both.
-
-## License
-
-[MIT](LICENSE)

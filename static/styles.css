@@ -170,6 +170,12 @@ a {
   line-height: 1;
 }
 
+a.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  color: var(--text);
+}
+
 .icon-btn:hover {
   border-color: var(--muted);
 }
@@ -690,6 +696,20 @@ label.btn {
 
 .trust-body strong {
   color: var(--danger);
+}
+
+.trust-body .trust-note {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.trust-body .trust-note[hidden] {
+  display: none;
+}
+
+.trust-body .trust-note code {
+  background: var(--surface);
 }
 
 #change-folder {
