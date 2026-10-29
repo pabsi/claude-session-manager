@@ -2,6 +2,7 @@ import { connectServer } from "./backend-server.js";
 import * as local from "./backend-browser.js";
 
 const LIVE_WINDOW_MS = 5 * 60 * 1000;
+const NAME_MAX = 64; // session names in the batch delete confirmation
 const TIME_UNITS = [
   ["year", 31536000],
   ["month", 2592000],
@@ -27,6 +28,9 @@ const state = {
   project: "",
   sortKey: "lastActive",
   sortDesc: true,
+  selected: new Set(),
+  visibleIds: [],
+  anchorId: null, // last row clicked, the start of a Shift+click range
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -37,6 +41,12 @@ const $$ = (sel) => document.querySelectorAll(sel);
 const escapeHtml = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+// At most `max` characters, counting an emoji as one so it's never cut in half.
+function crop(text, max) {
+  const chars = Array.from(text);
+  return chars.length <= max ? text : chars.slice(0, max - 1).join("").trimEnd() + "…";
+}
 
 function shortPath(p) {
   p = p || "";
@@ -77,6 +87,16 @@ function formatTokens(n) {
   if (n < 1000) return String(n);
   const [div, unit] = n < 1e6 ? [1e3, "K"] : n < 1e9 ? [1e6, "M"] : [1e9, "B"];
   return `${(n / div).toFixed(n / div < 10 ? 1 : 0)}${unit}`;
+}
+
+function subagentTotals(s) {
+  const usage = Object.fromEntries(Object.keys(USAGE_LABELS).map((k) => [k, 0]));
+  let messages = 0;
+  for (const a of s.subagents) {
+    messages += a.messages;
+    for (const k of Object.keys(usage)) usage[k] += a.usage[k];
+  }
+  return { messages, usage };
 }
 
 function usageTitle(s) {
@@ -174,6 +194,8 @@ async function reload() {
     state.home = backend.home;
     state.sessions = sessions;
     state.trash = trash;
+    const ids = new Set(sessions.map((s) => s.id));
+    state.selected = new Set([...state.selected].filter((id) => ids.has(id)));
     renderProjects();
     render();
   } catch (err) {
@@ -256,8 +278,12 @@ function sessionRow(s) {
     s.gitBranch && s.gitBranch !== "HEAD" ? `<div class="branch">${escapeHtml(s.gitBranch)}</div>` : "";
   const effort = s.effort ? `<small>${escapeHtml(s.effort)} effort</small>` : "";
   const live = isLive(s) ? `<span class="badge live" title="Written to in the last 5 minutes">live</span>` : "";
-  return `<tr data-id="${s.id}">
-    <td>
+  const selected = state.selected.has(s.id);
+  return `<tr data-id="${s.id}"${selected ? ' class="selected"' : ""}>
+    <td class="select-cell">
+      <input type="checkbox" class="row-select" aria-label="Select session"${selected ? " checked" : ""}>
+    </td>
+    <td class="session-cell">
       <a href="#" class="title link" data-action="view" title="View transcript">${escapeHtml(title)}</a>
       ${prompt}
       <div class="sid">${s.id}</div>
@@ -267,7 +293,7 @@ function sessionRow(s) {
       <div class="project" title="${escapeHtml(s.cwd)}">${escapeHtml(compactPath(s.cwd) || s.project)}</div>
       ${branch}
     </td>
-    <td>${sourceBadge(s)}${live}</td>
+    <td class="source-cell">${sourceBadge(s)}${live}</td>
     <td class="model" title="${escapeHtml(s.model)}">
       ${escapeHtml(formatModel(s.model)) || "—"}${effort}
     </td>
@@ -280,7 +306,7 @@ function sessionRow(s) {
     <td>
       <div class="actions">
         <button class="btn primary" data-action="resume" title="Copy resume command">Resume</button>
-        <button class="btn danger" data-action="trash" title="Move to trash">Delete</button>
+        <button class="btn" data-action="details">Details</button>
       </div>
     </td>
   </tr>`;
@@ -308,8 +334,10 @@ function trashRow(t) {
 
 function render() {
   const rows = filteredSessions();
+  state.visibleIds = rows.map((s) => s.id);
   $("#rows").innerHTML = rows.map(sessionRow).join("");
   $("#empty").hidden = rows.length > 0;
+  syncSelection();
   $("#trash-rows").innerHTML = state.trash.map(trashRow).join("");
   $("#trash-empty").hidden = state.trash.length > 0;
 
@@ -334,6 +362,130 @@ function setView(view) {
   $$(".tab").forEach((t) => t.setAttribute("aria-selected", String(t.dataset.view === view)));
   $("#view-sessions").hidden = $("#toolbar-sessions").hidden = view !== "sessions";
   $("#view-trash").hidden = $("#toolbar-trash").hidden = view !== "trash";
+  syncSelection();
+}
+
+// ---------- selection ----------
+
+// Updates checkboxes and the selection bar in place, so expanded rows stay expanded.
+function syncSelection() {
+  const { selected, visibleIds } = state;
+  for (const tr of $("#rows").children) {
+    const on = selected.has(tr.dataset.id);
+    tr.classList.toggle("selected", on);
+    tr.querySelector(".row-select").checked = on;
+  }
+  const shown = visibleIds.filter((id) => selected.has(id)).length;
+  $("#select-all").checked = shown > 0 && shown === visibleIds.length;
+  $("#select-all").indeterminate = shown > 0 && shown < visibleIds.length;
+
+  $("#selection-bar").hidden = state.view !== "sessions" || selected.size === 0 || !backend?.writable;
+  const filteredOut = selected.size - shown;
+  $("#selection-count").textContent =
+    `${selected.size} selected` + (filteredOut ? ` (${filteredOut} hidden by filters)` : "");
+  $("#delete-selected").textContent = `Delete ${plural(selected.size, "session")}`;
+}
+
+function rangeIds(from, to) {
+  const a = state.visibleIds.indexOf(from);
+  const b = state.visibleIds.indexOf(to);
+  if (a < 0 || b < 0) return [to];
+  return state.visibleIds.slice(Math.min(a, b), Math.max(a, b) + 1);
+}
+
+function toggleRow(cell, e) {
+  const input = cell.querySelector(".row-select");
+  if (e.target !== input) input.checked = !input.checked; // a click on the cell around the box
+  const id = cell.closest("tr").dataset.id;
+  const ids = e.shiftKey && state.anchorId ? rangeIds(state.anchorId, id) : [id];
+  for (const x of ids) {
+    if (input.checked) state.selected.add(x);
+    else state.selected.delete(x);
+  }
+  state.anchorId = id;
+  if (e.shiftKey) getSelection()?.removeAllRanges(); // Shift+click also selects page text
+  syncSelection();
+}
+
+function clearSelection() {
+  state.selected.clear();
+  state.anchorId = null;
+  syncSelection();
+}
+
+async function deleteSelected() {
+  const chosen = state.sessions.filter((s) => state.selected.has(s.id));
+  if (!chosen.length) return;
+  const names = chosen.slice(0, 5).map((s) => `• ${crop(s.title || s.firstPrompt || s.id, NAME_MAX)}`);
+  if (chosen.length > 5) names.push(`…and ${chosen.length - 5} more`);
+  const live = chosen.filter(isLive).length;
+  const warn = !live
+    ? ""
+    : chosen.length === 1
+      ? "\n\nIt was active in the last 5 minutes and may still be open."
+      : `\n\n${live === 1 ? "One of them was" : `${live} of them were`} active in the last 5 minutes ` +
+        "and may still be open.";
+  const ok = await confirmDialog(
+    `Move ${plural(chosen.length, "session")} to trash?`,
+    `${names.join("\n")}\n\nTranscripts, subagents, file history and session env are moved to the ` +
+      `trash. You can restore them from the Trash tab.${warn}`,
+    "Move to trash",
+  );
+  if (!ok) return;
+  const failed = [];
+  await withBusy($("#delete-selected"), async () => {
+    for (const s of chosen) {
+      try {
+        const manifest = await backend.trashSession(s.id);
+        state.trash.unshift({ ...manifest, size: s.size });
+        state.sessions = state.sessions.filter((x) => x.id !== s.id);
+        state.selected.delete(s.id);
+      } catch (err) {
+        failed.push(`${s.title || s.id}: ${err.message}`);
+      }
+    }
+  });
+  renderProjects();
+  render();
+  const moved = chosen.length - failed.length;
+  if (failed.length) toast(`Moved ${moved} to trash. Failed: ${escapeHtml(failed.join("; "))}`, true);
+  else toast(`Moved ${plural(moved, "session")} to trash`);
+}
+
+// ---------- details ----------
+
+function openDetails(s) {
+  const sub = subagentTotals(s);
+  const hasSub = s.subagents.length > 0;
+  const own = Object.fromEntries(Object.keys(USAGE_LABELS).map((k) => [k, s.usage[k] - sub.usage[k]]));
+  const n = (v) => v.toLocaleString();
+  const cols = hasSub ? [own, sub.usage, s.usage] : [s.usage];
+  const rows = Object.entries(USAGE_LABELS).map(
+    ([k, label]) => `<tr><td>${label}</td>${cols.map((c) => `<td>${n(c[k])}</td>`).join("")}</tr>`,
+  );
+  const totals = cols.map((c) => `<td>${n(totalTokens(c))}</td>`).join("");
+  const head = hasSub ? "<th>This session</th><th>Subagents</th><th>Total</th>" : "<th>Tokens</th>";
+  const subMessages = hasSub
+    ? `<small>+ ${sub.messages} in ${plural(s.subagents.length, "subagent")}</small>`
+    : "";
+  const total = totalTokens(s.usage);
+
+  $("#details-title").textContent = s.title || s.firstPrompt || s.id;
+  $("#details-body").innerHTML = `
+    <div class="details-id">${s.id}</div>
+    <dl class="stats">
+      <div><dt>Messages</dt><dd>${n(s.messages)}${subMessages}</dd></div>
+      <div><dt>Tokens</dt><dd>${formatTokens(total)}<small>${n(total)}</small></dd></div>
+      <div><dt>Size</dt><dd>${formatSize(s.size)}<small>${n(s.size)} bytes</small></dd></div>
+    </dl>
+    <h3>Token consumption</h3>
+    <div class="usage-wrap">
+      <table class="usage">
+        <thead><tr><th></th>${head}</tr></thead>
+        <tbody>${rows.join("")}<tr class="total"><td>Total</td>${totals}</tr></tbody>
+      </table>
+    </div>`;
+  $("#details").showModal();
 }
 
 // ---------- transcript viewer ----------
@@ -468,24 +620,8 @@ const actions = {
     toast(`Copied <code>${escapeHtml(cmd)}</code>`);
   },
 
-  async trash(id, button) {
-    const s = findSession(id);
-    const warn = isLive(s) ? "\n\nThis session was active in the last 5 minutes. It may still be open." : "";
-    const ok = await confirmDialog(
-      "Move session to trash?",
-      `“${s.title || s.firstPrompt || id}”\n\nThe transcript, subagents, file history and session env ` +
-        `are moved to the trash. You can restore it from the Trash tab.${warn}`,
-      "Move to trash",
-    );
-    if (!ok) return;
-    await withBusy(button, async () => {
-      const manifest = await backend.trashSession(id);
-      state.sessions = state.sessions.filter((x) => x.id !== id);
-      state.trash.unshift({ ...manifest, size: s.size });
-      renderProjects();
-      render();
-      toast("Moved to trash");
-    });
+  details(id) {
+    openDetails(findSession(id));
   },
 
   async restore(id, button) {
@@ -577,16 +713,31 @@ $$(".grid th[data-sort]").forEach((th) =>
 );
 
 $$(".tab").forEach((t) => t.addEventListener("click", () => setView(t.dataset.view)));
-$("#rows").addEventListener("click", onTableClick);
+$("#rows").addEventListener("click", (e) => {
+  const cell = e.target.closest(".select-cell");
+  if (cell) toggleRow(cell, e);
+  else onTableClick(e);
+});
+$("#select-all").addEventListener("change", (e) => {
+  for (const id of state.visibleIds) {
+    if (e.target.checked) state.selected.add(id);
+    else state.selected.delete(id);
+  }
+  syncSelection();
+});
+$("#delete-selected").addEventListener("click", deleteSelected);
+$("#clear-selection").addEventListener("click", clearSelection);
 $("#trash-rows").addEventListener("click", onTableClick);
 $("#theme-toggle").addEventListener("click", toggleTheme);
 $("#refresh").addEventListener("click", load);
 $("#empty-trash").addEventListener("click", emptyTrash);
 
 $("#viewer-close").addEventListener("click", () => $("#viewer").close());
-$("#viewer").addEventListener("click", (e) => {
-  if (e.target === e.currentTarget) e.currentTarget.close(); // click on the backdrop
-});
+for (const dlg of [$("#viewer"), $("#details")]) {
+  dlg.addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) e.currentTarget.close(); // click on the backdrop
+  });
+}
 $("#viewer").addEventListener("close", () => (viewer.sessionId = null));
 $("#viewer-resume").addEventListener("click", () => actions.resume(viewer.sessionId));
 $("#viewer-bottom").addEventListener("click", () => {
@@ -607,8 +758,11 @@ document.addEventListener("keydown", (e) => {
     render();
     e.target.blur();
   }
-  if (e.target.matches("input, select, textarea") || e.ctrlKey || e.metaKey || e.altKey) return;
-  if (e.key === "/") {
+  const typing = e.target.matches("input:not([type=checkbox]), select, textarea");
+  if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === "Escape" && state.selected.size) {
+    clearSelection();
+  } else if (e.key === "/") {
     e.preventDefault();
     setView("sessions");
     $("#search").focus();

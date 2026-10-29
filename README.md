@@ -54,7 +54,11 @@ deployment → Source: GitHub Actions**.
   long outputs are cut at 8,000 characters). Thinking is stored encrypted, so it isn't shown.
 - **Resume** copies `cd '<cwd>' && claude --resume <id>` to the clipboard (a PowerShell
   equivalent on Windows).
-- **Delete** moves the session to `~/.claude/.csm-trash/<id>/`: the transcript, its
+- **Details** opens a summary: messages, token consumption by type (session and
+  subagents) and size.
+- **Delete**: tick the checkbox on one or more rows (Shift+click selects a range, the
+  header box selects everything shown), then **Delete N sessions** above the table.
+  Each session is moved to `~/.claude/.csm-trash/<id>/`: the transcript, its
   subagents/tool-results dir, `file-history/<id>`, `session-env/<id>` and any
   `todos/<id>*.json`. The Trash tab can restore or permanently delete each session,
   or **Empty trash** to delete them all. Both modes share this trash.
@@ -68,7 +72,7 @@ deployment → Source: GitHub Actions**.
 
 ## Keyboard
 
-`/` search · `Esc` clear search · `t` toggle theme · `r` refresh
+`/` search · `Esc` clear search or selection · `t` toggle theme · `r` refresh
 
 ## Config (serve.py)
 

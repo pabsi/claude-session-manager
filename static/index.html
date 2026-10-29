@@ -83,10 +83,19 @@
       <select id="project" aria-label="Project"><option value="">All projects</option></select>
     </section>
 
+    <section class="selection-bar" id="selection-bar" hidden>
+      <button class="btn danger" id="delete-selected"></button>
+      <span class="selection-count" id="selection-count"></span>
+      <button class="link-btn" id="clear-selection" title="Clear selection (Esc)">Clear</button>
+    </section>
+
     <div class="table-wrap" id="view-sessions" hidden>
       <table class="grid">
         <thead>
           <tr>
+            <th class="select-col">
+              <input type="checkbox" id="select-all" aria-label="Select all shown sessions">
+            </th>
             <th data-sort="title" class="session-col">Session</th>
             <th data-sort="cwd">Project</th>
             <th data-sort="source">Source</th>
@@ -132,6 +141,19 @@
       <div class="dialog-actions">
         <button value="cancel" class="btn">Cancel</button>
         <button value="ok" class="btn danger" id="confirm-ok">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="details" aria-labelledby="details-title">
+    <form method="dialog">
+      <header class="details-head">
+        <h2 id="details-title"></h2>
+        <button value="close" class="icon-btn" aria-label="Close" title="Close (Esc)">✕</button>
+      </header>
+      <div id="details-body"></div>
+      <div class="dialog-actions">
+        <button value="close" class="btn">Close</button>
       </div>
     </form>
   </dialog>
