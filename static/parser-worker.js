@@ -27,6 +27,15 @@ const USAGE_FIELDS = {
   output: "output_tokens",
 };
 
+const TOOL_OUTCOMES = ["succeeded", "errored", "interrupted", "rejected"];
+// Error results Claude Code writes when a call never ran: the user or auto mode refused it.
+const REJECTED_RE = new RegExp(
+  "^(The user doesn't want to (proceed with|take) this" +
+    "|Permission (for|to use) .+ denied" +
+    "|The server-side auto mode classifier)",
+);
+const INTERRUPTED_RE = /\[Request interrupted by user/;
+
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isNoise = (text) => NOISE_PREFIXES.some((p) => text.startsWith(p));
 const squash = (text) => text.split(/\s+/).filter(Boolean).join(" ");
@@ -80,18 +89,58 @@ function cleanPrompt(text) {
 
 const emptyUsage = () => Object.fromEntries(Object.keys(USAGE_FIELDS).map((k) => [k, 0]));
 
-function recordAssistant(info, rec, responseIds) {
+function toolOutcome(block, rec) {
+  const text = toolResultText(block.content).trim();
+  if (INTERRUPTED_RE.test(text) || (isObject(rec.toolUseResult) && rec.toolUseResult.interrupted)) {
+    return "interrupted";
+  }
+  if (!block.is_error) return "succeeded";
+  return REJECTED_RE.test(text) ? "rejected" : "errored";
+}
+
+function recordToolResults(rec, content, outcomes) {
+  for (const b of Array.isArray(content) ? content : []) {
+    // The same result can be written more than once; the first one counts.
+    if (isObject(b) && b.type === "tool_result" && !outcomes.has(b.tool_use_id)) {
+      outcomes.set(b.tool_use_id, toolOutcome(b, rec));
+    }
+  }
+}
+
+function toolCounts(calls, outcomes) {
+  const counts = Object.fromEntries(["total", ...TOOL_OUTCOMES].map((k) => [k, 0]));
+  for (const id of calls) {
+    counts.total++;
+    counts[outcomes.get(id) || "interrupted"]++; // no result: the session stopped mid-call
+  }
+  return counts;
+}
+
+function countModel(models, model, effort) {
+  const entry = models.find((m) => m.model === model && m.effort === effort);
+  if (entry) entry.responses++;
+  else models.push({ model, effort, responses: 1 });
+}
+
+function recordAssistant(info, rec, responseIds, toolCalls) {
   const message = rec.message || {};
-  if (message.model && message.model !== "<synthetic>") {
+  for (const b of Array.isArray(message.content) ? message.content : []) {
+    if (isObject(b) && b.type === "tool_use") toolCalls.add(b.id);
+  }
+  const realModel = Boolean(message.model) && message.model !== "<synthetic>";
+  if (realModel) {
     info.model = message.model;
     info.effort = rec.effort || "";
   }
   // Every content block of one API response is its own record repeating the same usage.
   const responseId = message.id || rec.requestId;
-  if (!isObject(message.usage) || !responseId || responseIds.has(responseId)) return;
+  if (!responseId || responseIds.has(responseId)) return;
   responseIds.add(responseId);
+  if (realModel) countModel(info.models, message.model, info.effort);
   for (const [key, field] of Object.entries(USAGE_FIELDS)) {
-    if (Number.isInteger(message.usage[field])) info.usage[key] += message.usage[field];
+    if (isObject(message.usage) && Number.isInteger(message.usage[field])) {
+      info.usage[key] += message.usage[field];
+    }
   }
 }
 
@@ -111,13 +160,20 @@ function parseMeta(text) {
     model: "",
     effort: "",
     usage: emptyUsage(),
+    models: [], // {model, effort, responses} in order of first use
+    compactions: { manual: 0, auto: 0 },
   };
   const responseIds = new Set();
+  const toolCalls = new Set();
+  const outcomes = new Map();
   for (const rec of records(text)) {
     const kind = rec.type;
     if (kind === "ai-title") info.title = rec.aiTitle || info.title;
     else if (kind === "custom-title") info.customTitle = rec.customTitle || info.customTitle;
     else if (kind === "summary" && !info.title) info.title = rec.summary || "";
+    else if (kind === "system" && rec.subtype === "compact_boundary") {
+      info.compactions[(rec.compactMetadata || {}).trigger === "manual" ? "manual" : "auto"]++;
+    }
     if (kind !== "user" && kind !== "assistant") continue;
     if (rec.timestamp) {
       info.started ||= rec.timestamp;
@@ -128,11 +184,12 @@ function parseMeta(text) {
     }
     if (kind === "assistant") {
       info.assistantMessages++;
-      recordAssistant(info, rec, responseIds);
+      recordAssistant(info, rec, responseIds, toolCalls);
       continue;
     }
     if (rec.isMeta) continue;
     const content = (rec.message || {}).content;
+    recordToolResults(rec, content, outcomes);
     // Tool results come back as user records; only count real prompts.
     const onlyToolResults =
       Array.isArray(content) && content.length && content.every((b) => isObject(b) && b.type === "tool_result");
@@ -147,6 +204,7 @@ function parseMeta(text) {
     }
   }
   if (!info.firstPrompt && info.firstCommand) info.firstPrompt = `(only ran ${info.firstCommand})`;
+  info.tools = toolCounts(toolCalls, outcomes);
   return info;
 }
 

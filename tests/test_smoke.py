@@ -19,6 +19,7 @@ import store  # noqa: E402
 
 SID = "11111111-2222-3333-4444-555555555555"
 PROJECT = CLAUDE / "projects" / "-home-me-repo"
+REJECTED = "The user doesn't want to proceed with this tool use."
 USAGE = {
     "input_tokens": 3,
     "cache_creation_input_tokens": 100,
@@ -43,6 +44,17 @@ def make_session():
                 "timestamp": "2026-01-01T10:00:00Z",
                 "message": {"content": "Fix the 🐛"},
             },
+            {
+                **base,
+                "type": "assistant",
+                "effort": "medium",
+                "timestamp": "2026-01-01T10:00:02Z",
+                "message": {"id": "m0", "model": "claude-sonnet-5-5", "content": []},
+            },
+            *(
+                {"type": "system", "subtype": "compact_boundary", "compactMetadata": {"trigger": trigger}}
+                for trigger in ("manual", "manual", "auto")
+            ),
             *(
                 {
                     **base,
@@ -54,15 +66,26 @@ def make_session():
                 # One record per content block, each repeating the response's usage.
                 for block in (
                     {"type": "text", "text": "Looking."},
-                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+                    *(
+                        {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": "ls"}}
+                        for i in range(1, 5)
+                    ),
                 )
             ),
-            {
-                **base,
-                "type": "user",
-                "timestamp": "2026-01-01T10:00:06Z",
-                "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "a.txt"}]},
-            },
+            *(
+                {
+                    **base,
+                    "type": "user",
+                    "timestamp": "2026-01-01T10:00:06Z",
+                    "message": {"content": [{"type": "tool_result", **result}]},
+                }
+                for result in (
+                    {"tool_use_id": "t1", "content": "a.txt"},
+                    {"tool_use_id": "t1", "content": "a.txt"},  # written twice, counted once
+                    {"tool_use_id": "t2", "is_error": True, "content": REJECTED},
+                    {"tool_use_id": "t3", "is_error": True, "content": "Exit code 1"},
+                )  # t4 has no result: interrupted
+            ),
             {"type": "ai-title", "aiTitle": "Bug fix", "sessionId": SID},
         ],
     )
@@ -93,10 +116,17 @@ class StoreTest(unittest.TestCase):
         [s] = store.list_sessions()
         self.assertEqual(s["title"], "Bug fix")
         self.assertEqual(s["firstPrompt"], "Fix the 🐛")
-        self.assertEqual((s["messages"], s["source"], s["gitBranch"]), (3, "cli", "main"))
+        self.assertEqual((s["messages"], s["source"], s["gitBranch"]), (7, "cli", "main"))
         self.assertEqual((s["model"], s["effort"]), ("claude-opus-5-5", "high"))
         # The main response counts once despite two records, plus the subagent's response.
         self.assertEqual(s["usage"], {"input": 6, "cacheWrite": 200, "cacheRead": 2000, "output": 40})
+        outcomes = {"succeeded": 1, "errored": 1, "interrupted": 1, "rejected": 1}
+        self.assertEqual(s["tools"], {"total": 4, **outcomes})
+        self.assertEqual(s["compactions"], {"manual": 2, "auto": 1})
+        self.assertEqual(
+            [(m["model"], m["effort"], m["responses"]) for m in s["models"]],
+            [("claude-sonnet-5-5", "medium", 1), ("claude-opus-5-5", "high", 1)],
+        )
         self.assertEqual([a["agentType"] for a in s["subagents"]], ["Explore"])
 
     def test_transcript_attaches_tool_results(self):

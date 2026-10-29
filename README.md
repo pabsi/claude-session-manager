@@ -54,8 +54,12 @@ deployment → Source: GitHub Actions**.
   long outputs are cut at 8,000 characters). Thinking is stored encrypted, so it isn't shown.
 - **Resume** copies `cd '<cwd>' && claude --resume <id>` to the clipboard (a PowerShell
   equivalent on Windows).
-- **Details** opens a summary: messages, token consumption by type (session and
-  subagents) and size.
+- **Details** opens a summary: messages, size, token consumption by type, and tool calls
+  by outcome (succeeded, errored, interrupted, rejected), split into session and subagents;
+  how many times the conversation was compacted (`/compact` and automatic); and every
+  model and effort level used, with the number of replies each.
+  "Rejected" covers calls refused by you or by auto mode; "interrupted" includes calls that
+  never got a result.
 - **Delete**: tick the checkbox on one or more rows (Shift+click selects a range, the
   header box selects everything shown), then **Delete N sessions** above the table.
   Each session is moved to `~/.claude/.csm-trash/<id>/`: the transcript, its

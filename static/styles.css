@@ -647,9 +647,53 @@ input[type="checkbox"] {
   color: var(--muted);
 }
 
-.usage tr.total td {
+.usage tr:last-child td {
   border-bottom: 0;
+}
+
+.usage tr.total td {
   font-weight: 650;
+}
+
+.usage .text {
+  text-align: left;
+}
+
+.counter {
+  color: var(--text);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 18px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.counter strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.counter code {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.counter span {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.details-note {
+  color: var(--muted);
+  margin: 0 0 18px;
+}
+
+.usage tr.part td:first-child {
+  padding-left: 20px;
+  color: var(--muted);
 }
 
 /* Subagents */

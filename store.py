@@ -50,6 +50,15 @@ USAGE_FIELDS = {
     "output": "output_tokens",
 }
 
+TOOL_OUTCOMES = ("succeeded", "errored", "interrupted", "rejected")
+# Error results Claude Code writes when a call never ran: the user or auto mode refused it.
+REJECTED_RE = re.compile(
+    r"^(The user doesn't want to (proceed with|take) this"
+    r"|Permission (for|to use) .+ denied"
+    r"|The server-side auto mode classifier)"
+)
+INTERRUPTED_RE = re.compile(r"\[Request interrupted by user")
+
 _cache = {}  # path -> (mtime_ns, size, info)
 _lock = threading.Lock()
 
@@ -95,28 +104,67 @@ def _empty_usage():
     return dict.fromkeys(USAGE_FIELDS, 0)
 
 
-def _sum_usage(usages):
-    total = _empty_usage()
-    for usage in usages:
+def _sum_counts(counts):
+    total = dict.fromkeys(counts[0], 0)
+    for c in counts:
         for key in total:
-            total[key] += usage[key]
+            total[key] += c[key]
     return total
 
 
-def _record_assistant(info, rec, response_ids):
+def _tool_outcome(block, rec):
+    text = _tool_result_text(block.get("content")).strip()
+    details = rec.get("toolUseResult")
+    if INTERRUPTED_RE.search(text) or (isinstance(details, dict) and details.get("interrupted")):
+        return "interrupted"
+    if not block.get("is_error"):
+        return "succeeded"
+    return "rejected" if REJECTED_RE.match(text) else "errored"
+
+
+def _record_tool_results(rec, content, outcomes):
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            # The same result can be written more than once; the first one counts.
+            outcomes.setdefault(block.get("tool_use_id"), _tool_outcome(block, rec))
+
+
+def _tool_counts(calls, outcomes):
+    counts = dict.fromkeys(("total", *TOOL_OUTCOMES), 0)
+    for call_id in calls:
+        counts["total"] += 1
+        counts[outcomes.get(call_id, "interrupted")] += 1  # no result: the session stopped mid-call
+    return counts
+
+
+def _count_model(models, model, effort):
+    for entry in models:
+        if entry["model"] == model and entry["effort"] == effort:
+            entry["responses"] += 1
+            return
+    models.append({"model": model, "effort": effort, "responses": 1})
+
+
+def _record_assistant(info, rec, response_ids, tool_calls):
     message = rec.get("message") or {}
+    for block in message.get("content") if isinstance(message.get("content"), list) else []:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            tool_calls.setdefault(block.get("id"))
     model = message.get("model")
-    if model and model != "<synthetic>":
+    real_model = bool(model) and model != "<synthetic>"
+    if real_model:
         info["model"] = model
         info["effort"] = rec.get("effort") or ""
     # Every content block of one API response is its own record repeating the same usage.
     response_id = message.get("id") or rec.get("requestId")
-    usage = message.get("usage")
-    if not isinstance(usage, dict) or not response_id or response_id in response_ids:
+    if not response_id or response_id in response_ids:
         return
     response_ids.add(response_id)
+    if real_model:
+        _count_model(info["models"], model, info["effort"])
+    usage = message.get("usage")
     for key, field in USAGE_FIELDS.items():
-        if isinstance(usage.get(field), int):
+        if isinstance(usage, dict) and isinstance(usage.get(field), int):
             info["usage"][key] += usage[field]
 
 
@@ -136,8 +184,10 @@ def _parse_meta(path):
         "model": "",
         "effort": "",
         "usage": _empty_usage(),
+        "models": [],  # {model, effort, responses} in order of first use
+        "compactions": {"manual": 0, "auto": 0},
     }
-    response_ids = set()
+    response_ids, tool_calls, outcomes = set(), {}, {}
     for rec in _records(path):
         kind = rec.get("type")
         if kind == "ai-title":
@@ -146,6 +196,9 @@ def _parse_meta(path):
             info["customTitle"] = rec.get("customTitle") or info["customTitle"]
         elif kind == "summary" and not info["title"]:
             info["title"] = rec.get("summary", "")
+        elif kind == "system" and rec.get("subtype") == "compact_boundary":
+            trigger = (rec.get("compactMetadata") or {}).get("trigger")
+            info["compactions"]["manual" if trigger == "manual" else "auto"] += 1
         if kind not in ("user", "assistant"):
             continue
         if ts := rec.get("timestamp"):
@@ -156,11 +209,12 @@ def _parse_meta(path):
                 info[key] = rec[key]
         if kind == "assistant":
             info["assistantMessages"] += 1
-            _record_assistant(info, rec, response_ids)
+            _record_assistant(info, rec, response_ids, tool_calls)
             continue
         if rec.get("isMeta"):
             continue
         content = (rec.get("message") or {}).get("content")
+        _record_tool_results(rec, content, outcomes)
         # Tool results come back as user records; only count real prompts.
         if (
             isinstance(content, list)
@@ -179,6 +233,7 @@ def _parse_meta(path):
                 info["firstCommand"] = cmd[1]
     if not info["firstPrompt"] and info["firstCommand"]:
         info["firstPrompt"] = f"(only ran {info['firstCommand']})"
+    info["tools"] = _tool_counts(tool_calls, outcomes)
     return info
 
 
@@ -297,6 +352,9 @@ def _subagents(session_dir):
                 "lastActive": info["lastActive"],
                 "messages": info["userMessages"] + info["assistantMessages"],
                 "usage": info["usage"],
+                "tools": info["tools"],
+                "models": info["models"],
+                "compactions": info["compactions"],
                 "size": stat.st_size,
             }
         )
@@ -331,7 +389,10 @@ def list_sessions():
                     "messages": info["userMessages"] + info["assistantMessages"],
                     "model": info["model"],
                     "effort": info["effort"],
-                    "usage": _sum_usage([info["usage"], *(a["usage"] for a in subagents)]),
+                    "usage": _sum_counts([info["usage"], *(a["usage"] for a in subagents)]),
+                    "tools": _sum_counts([info["tools"], *(a["tools"] for a in subagents)]),
+                    "models": info["models"],
+                    "compactions": _sum_counts([info["compactions"], *(a["compactions"] for a in subagents)]),
                     "size": stat.st_size + _dir_size(session_dir),
                     "subagents": subagents,
                 }

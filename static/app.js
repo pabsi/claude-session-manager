@@ -2,7 +2,7 @@ import { connectServer } from "./backend-server.js";
 import * as local from "./backend-browser.js";
 
 const LIVE_WINDOW_MS = 5 * 60 * 1000;
-const NAME_MAX = 64; // session names in the batch delete confirmation
+const NAME_MAX = 64; // session names in the delete confirmation and details title
 const TIME_UNITS = [
   ["year", 31536000],
   ["month", 2592000],
@@ -13,6 +13,14 @@ const TIME_UNITS = [
 ];
 const NUMERIC_SORTS = ["lastActive", "messages", "tokens", "size"];
 const USAGE_LABELS = { input: "Input", cacheWrite: "Cache write", cacheRead: "Cache read", output: "Output" };
+const TOKEN_ROWS = [...Object.entries(USAGE_LABELS), [null, "Total", "total"]]; // null key: sum of the column
+const TOOL_ROWS = [
+  ["total", "Total tool calls", "total"],
+  ["succeeded", "Succeeded", "part"],
+  ["errored", "Errored", "part"],
+  ["interrupted", "Interrupted", "part"],
+  ["rejected", "Rejected", "part"],
+];
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 
 let backend = null;
@@ -89,14 +97,11 @@ function formatTokens(n) {
   return `${(n / div).toFixed(n / div < 10 ? 1 : 0)}${unit}`;
 }
 
-function subagentTotals(s) {
-  const usage = Object.fromEntries(Object.keys(USAGE_LABELS).map((k) => [k, 0]));
-  let messages = 0;
-  for (const a of s.subagents) {
-    messages += a.messages;
-    for (const k of Object.keys(usage)) usage[k] += a.usage[k];
-  }
-  return { messages, usage };
+// Sums of one count field (usage, tools) over a session's subagents.
+function subagentSum(s, field) {
+  return Object.fromEntries(
+    Object.keys(s[field]).map((k) => [k, s.subagents.reduce((n, a) => n + a[field][k], 0)]),
+  );
 }
 
 function usageTitle(s) {
@@ -454,23 +459,76 @@ async function deleteSelected() {
 
 // ---------- details ----------
 
+// One row per [key, label, class]; with subagents, columns split into this session / subagents / total.
+function breakdownTable(s, field, rows, header) {
+  const total = s[field];
+  const sub = subagentSum(s, field);
+  const own = Object.fromEntries(Object.keys(total).map((k) => [k, total[k] - sub[k]]));
+  const cols = s.subagents.length ? [own, sub, total] : [total];
+  const head = s.subagents.length
+    ? "<th>This session</th><th>Subagents</th><th>Total</th>"
+    : `<th>${header}</th>`;
+  const body = rows.map(([key, label, cls]) => {
+    const cells = cols.map((c) => `<td>${(key ? c[key] : totalTokens(c)).toLocaleString()}</td>`);
+    return `<tr${cls ? ` class="${cls}"` : ""}><td>${label}</td>${cells.join("")}</tr>`;
+  });
+  return `<div class="usage-wrap">
+    <table class="usage">
+      <thead><tr><th></th>${head}</tr></thead>
+      <tbody>${body.join("")}</tbody>
+    </table>
+  </div>`;
+}
+
+// Model and effort pairs in order of first use, with replies counted per session and subagents.
+function modelsTable(s) {
+  const rows = new Map();
+  const add = (models, col) => {
+    for (const m of models) {
+      const key = `${m.model}\t${m.effort}`;
+      const row = rows.get(key) ?? { model: m.model, effort: m.effort, own: 0, sub: 0 };
+      row[col] += m.responses;
+      rows.set(key, row);
+    }
+  };
+  add(s.models, "own");
+  for (const a of s.subagents) add(a.models, "sub");
+  if (!rows.size) return `<p class="details-note">No model replies recorded.</p>`;
+
+  const split = s.subagents.length > 0;
+  const head = split ? "<th>This session</th><th>Subagents</th><th>Total</th>" : "<th>Replies</th>";
+  const body = [...rows.values()].map((r) => {
+    const counts = split ? [r.own, r.sub, r.own + r.sub] : [r.own];
+    return `<tr>
+      <td title="${escapeHtml(r.model)}">${escapeHtml(formatModel(r.model))}</td>
+      <td class="text">${escapeHtml(r.effort || "—")}</td>
+      ${counts.map((n) => `<td>${n.toLocaleString()}</td>`).join("")}
+    </tr>`;
+  });
+  return `<div class="usage-wrap">
+    <table class="usage">
+      <thead><tr><th>Model</th><th class="text">Effort</th>${head}</tr></thead>
+      <tbody>${body.join("")}</tbody>
+    </table>
+  </div>`;
+}
+
+function compactionsHtml(c) {
+  const auto = c.auto ? `<span>+ ${plural(c.auto, "automatic compaction")}</span>` : "";
+  return `<p class="counter"><strong>${c.manual.toLocaleString()}</strong> × <code>/compact</code>${auto}</p>`;
+}
+
 function openDetails(s) {
-  const sub = subagentTotals(s);
-  const hasSub = s.subagents.length > 0;
-  const own = Object.fromEntries(Object.keys(USAGE_LABELS).map((k) => [k, s.usage[k] - sub.usage[k]]));
   const n = (v) => v.toLocaleString();
-  const cols = hasSub ? [own, sub.usage, s.usage] : [s.usage];
-  const rows = Object.entries(USAGE_LABELS).map(
-    ([k, label]) => `<tr><td>${label}</td>${cols.map((c) => `<td>${n(c[k])}</td>`).join("")}</tr>`,
-  );
-  const totals = cols.map((c) => `<td>${n(totalTokens(c))}</td>`).join("");
-  const head = hasSub ? "<th>This session</th><th>Subagents</th><th>Total</th>" : "<th>Tokens</th>";
-  const subMessages = hasSub
-    ? `<small>+ ${sub.messages} in ${plural(s.subagents.length, "subagent")}</small>`
+  const subCount = s.subagents.reduce((sum, a) => sum + a.messages, 0);
+  const subMessages = s.subagents.length
+    ? `<small>+ ${subCount} in ${plural(s.subagents.length, "subagent")}</small>`
     : "";
   const total = totalTokens(s.usage);
 
-  $("#details-title").textContent = s.title || s.firstPrompt || s.id;
+  const name = s.title || s.firstPrompt || s.id;
+  $("#details-title").textContent = crop(name, NAME_MAX);
+  $("#details-title").title = name;
   $("#details-body").innerHTML = `
     <div class="details-id">${s.id}</div>
     <dl class="stats">
@@ -479,12 +537,13 @@ function openDetails(s) {
       <div><dt>Size</dt><dd>${formatSize(s.size)}<small>${n(s.size)} bytes</small></dd></div>
     </dl>
     <h3>Token consumption</h3>
-    <div class="usage-wrap">
-      <table class="usage">
-        <thead><tr><th></th>${head}</tr></thead>
-        <tbody>${rows.join("")}<tr class="total"><td>Total</td>${totals}</tr></tbody>
-      </table>
-    </div>`;
+    ${breakdownTable(s, "usage", TOKEN_ROWS, "Tokens")}
+    <h3>Compactions</h3>
+    ${compactionsHtml(s.compactions)}
+    <h3>Tool calls</h3>
+    ${breakdownTable(s, "tools", TOOL_ROWS, "Calls")}
+    <h3>Models</h3>
+    ${modelsTable(s)}`;
   $("#details").showModal();
 }
 

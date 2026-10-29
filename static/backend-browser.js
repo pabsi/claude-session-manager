@@ -6,7 +6,7 @@ const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const HOME_RE = /^(\/home\/[^/]+|\/Users\/[^/]+|[A-Za-z]:\\Users\\[^\\]+)/;
 const TRASH = ".csm-trash";
-const CACHE_KEY = "meta-cache-v2"; // bump when parseMeta's output changes
+const CACHE_KEY = "meta-cache-v4"; // bump when parseMeta's output changes
 
 export const canWrite = typeof window.showDirectoryPicker === "function";
 
@@ -192,10 +192,10 @@ async function treeSize(fs, path) {
   return total;
 }
 
-function sumUsage(usages) {
-  const total = { ...usages[0] };
-  for (const usage of usages.slice(1)) {
-    for (const key of Object.keys(total)) total[key] += usage[key];
+function sumCounts(counts) {
+  const total = { ...counts[0] };
+  for (const c of counts.slice(1)) {
+    for (const key of Object.keys(total)) total[key] += c[key];
   }
   return total;
 }
@@ -274,6 +274,9 @@ function createBackend(fs) {
           lastActive: info.lastActive,
           messages: info.userMessages + info.assistantMessages,
           usage: info.usage,
+          tools: info.tools,
+          models: info.models,
+          compactions: info.compactions,
           size: files[i].size,
         };
       }),
@@ -362,7 +365,10 @@ function createBackend(fs) {
             messages: info.userMessages + info.assistantMessages,
             model: info.model,
             effort: info.effort,
-            usage: sumUsage([info.usage, ...agents.map((a) => a.usage)]),
+            usage: sumCounts([info.usage, ...agents.map((a) => a.usage)]),
+            tools: sumCounts([info.tools, ...agents.map((a) => a.tools)]),
+            models: info.models,
+            compactions: sumCounts([info.compactions, ...agents.map((a) => a.compactions)]),
             size: files[i].size + dirSize,
             subagents: agents,
           };
