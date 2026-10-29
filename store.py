@@ -42,6 +42,14 @@ TOOL_SUMMARY_KEYS = (
     "skill",
 )
 
+# Token counts reported in each API response's usage, under the names the UI uses.
+USAGE_FIELDS = {
+    "input": "input_tokens",
+    "cacheWrite": "cache_creation_input_tokens",
+    "cacheRead": "cache_read_input_tokens",
+    "output": "output_tokens",
+}
+
 _cache = {}  # path -> (mtime_ns, size, info)
 _lock = threading.Lock()
 
@@ -83,6 +91,35 @@ def _clean_prompt(text):
     return _truncate(" ".join(text.split()), PROMPT_MAX)
 
 
+def _empty_usage():
+    return dict.fromkeys(USAGE_FIELDS, 0)
+
+
+def _sum_usage(usages):
+    total = _empty_usage()
+    for usage in usages:
+        for key in total:
+            total[key] += usage[key]
+    return total
+
+
+def _record_assistant(info, rec, response_ids):
+    message = rec.get("message") or {}
+    model = message.get("model")
+    if model and model != "<synthetic>":
+        info["model"] = model
+        info["effort"] = rec.get("effort") or ""
+    # Every content block of one API response is its own record repeating the same usage.
+    response_id = message.get("id") or rec.get("requestId")
+    usage = message.get("usage")
+    if not isinstance(usage, dict) or not response_id or response_id in response_ids:
+        return
+    response_ids.add(response_id)
+    for key, field in USAGE_FIELDS.items():
+        if isinstance(usage.get(field), int):
+            info["usage"][key] += usage[field]
+
+
 def _parse_meta(path):
     info = {
         "title": "",
@@ -96,7 +133,11 @@ def _parse_meta(path):
         "lastActive": "",
         "userMessages": 0,
         "assistantMessages": 0,
+        "model": "",
+        "effort": "",
+        "usage": _empty_usage(),
     }
+    response_ids = set()
     for rec in _records(path):
         kind = rec.get("type")
         if kind == "ai-title":
@@ -115,6 +156,7 @@ def _parse_meta(path):
                 info[key] = rec[key]
         if kind == "assistant":
             info["assistantMessages"] += 1
+            _record_assistant(info, rec, response_ids)
             continue
         if rec.get("isMeta"):
             continue
@@ -254,6 +296,7 @@ def _subagents(session_dir):
                 "started": info["started"],
                 "lastActive": info["lastActive"],
                 "messages": info["userMessages"] + info["assistantMessages"],
+                "usage": info["usage"],
                 "size": stat.st_size,
             }
         )
@@ -273,6 +316,7 @@ def list_sessions():
             if not (info["userMessages"] or info["assistantMessages"]):
                 continue
             session_dir = path.with_suffix("")
+            subagents = _subagents(session_dir)
             sessions.append(
                 {
                     "id": path.stem,
@@ -285,8 +329,11 @@ def list_sessions():
                     "started": info["started"],
                     "lastActive": info["lastActive"],
                     "messages": info["userMessages"] + info["assistantMessages"],
+                    "model": info["model"],
+                    "effort": info["effort"],
+                    "usage": _sum_usage([info["usage"], *(a["usage"] for a in subagents)]),
                     "size": stat.st_size + _dir_size(session_dir),
-                    "subagents": _subagents(session_dir),
+                    "subagents": subagents,
                 }
             )
         for key in [k for k in _cache if k not in seen and Path(k).parent.name != "subagents"]:

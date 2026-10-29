@@ -282,7 +282,7 @@ select {
 
 .grid th,
 .grid td {
-  padding: 10px 14px;
+  padding: 10px 12px;
   text-align: left;
   vertical-align: top;
 }
@@ -352,7 +352,7 @@ select {
 }
 
 .session-col {
-  min-width: 340px;
+  min-width: 300px;
 }
 
 .grid td:nth-child(3) {
@@ -391,7 +391,7 @@ select {
   font-family: var(--mono);
   font-size: 12.5px;
   white-space: nowrap;
-  max-width: 300px;
+  max-width: 250px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -411,6 +411,11 @@ select {
   white-space: nowrap;
 }
 
+.model {
+  white-space: nowrap;
+}
+
+.model small,
 .when small {
   display: block;
   color: var(--muted);
@@ -748,7 +753,8 @@ dialog.drawer {
   border: 0;
   border-left: 1px solid var(--border);
   border-radius: 0;
-  width: min(960px, 100vw);
+  width: 50vw;
+  min-width: min(640px, 100vw);
   max-width: none;
   height: 100dvh;
   max-height: none;
@@ -1048,7 +1054,7 @@ dialog p {
   color: #fff;
 }
 
-@media (max-width: 1360px) {
+@media (max-width: 1420px) {
   .table-wrap {
     overflow-x: auto;
   }

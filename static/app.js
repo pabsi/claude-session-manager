@@ -10,6 +10,8 @@ const TIME_UNITS = [
   ["hour", 3600],
   ["minute", 60],
 ];
+const NUMERIC_SORTS = ["lastActive", "messages", "tokens", "size"];
+const USAGE_LABELS = { input: "Input", cacheWrite: "Cache write", cacheRead: "Cache read", output: "Output" };
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 
 let backend = null;
@@ -67,6 +69,30 @@ function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+
+const totalTokens = (usage) => Object.values(usage || {}).reduce((sum, n) => sum + n, 0);
+
+function formatTokens(n) {
+  if (n < 1000) return String(n);
+  const [div, unit] = n < 1e6 ? [1e3, "K"] : n < 1e9 ? [1e6, "M"] : [1e9, "B"];
+  return `${(n / div).toFixed(n / div < 10 ? 1 : 0)}${unit}`;
+}
+
+function usageTitle(s) {
+  const lines = Object.entries(USAGE_LABELS).map(([k, label]) => `${label}: ${s.usage[k].toLocaleString()}`);
+  if (s.subagents.length) lines.push("Includes subagents");
+  return lines.join("\n");
+}
+
+// "claude-opus-5-5" -> "Opus 5.5", "claude-sonnet-4-5-20250929" -> "Sonnet 4.5"
+function formatModel(id) {
+  const parts = (id || "").replace(/^claude-/, "").replace(/-\d{8}$/, "").split("-").filter(Boolean);
+  const name = parts.filter((p) => !/^\d+$/.test(p));
+  const version = parts.filter((p) => /^\d+$/.test(p));
+  if (!name.length) return id || "";
+  const family = name.map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
+  return version.length ? `${family} ${version.join(".")}` : family;
 }
 
 const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
@@ -170,7 +196,8 @@ function renderProjects() {
 }
 
 function searchText(s) {
-  s._search ??= [s.title, s.firstPrompt, s.cwd, s.gitBranch, s.id, ...s.subagents.map((a) => a.description)]
+  s._search ??= [s.title, s.firstPrompt, s.cwd, s.gitBranch, s.id, formatModel(s.model), s.effort]
+    .concat(s.subagents.map((a) => a.description))
     .join(" ")
     .toLowerCase();
   return s._search;
@@ -185,7 +212,12 @@ function filteredSessions() {
       terms.every((t) => searchText(s).includes(t)),
   );
   const { sortKey: key, sortDesc: desc } = state;
-  const value = (s) => (key === "title" ? s.title || s.firstPrompt : s[key]);
+  const value = (s) => {
+    if (key === "title") return s.title || s.firstPrompt;
+    if (key === "tokens") return totalTokens(s.usage);
+    if (key === "model") return formatModel(s.model);
+    return s[key];
+  };
   return rows.sort((a, b) => {
     const [va, vb] = [value(a), value(b)];
     const cmp = typeof va === "number" ? va - vb : String(va ?? "").localeCompare(String(vb ?? ""));
@@ -200,7 +232,12 @@ function subagentsHtml(agents) {
     const label = escapeHtml(a.description || a.agentId);
     const id = escapeHtml(a.agentId);
     const link = `<a href="#" class="link" data-action="viewAgent" data-agent="${id}">${label}</a>`;
-    const meta = `${a.messages} msgs · ${formatSize(a.size)} · ${escapeHtml(relativeTime(a.started))}`;
+    const meta = [
+      `${a.messages} msgs`,
+      `${formatTokens(totalTokens(a.usage))} tokens`,
+      formatSize(a.size),
+      escapeHtml(relativeTime(a.started)),
+    ].join(" · ");
     return `<li>${type}${link} <span class="agent-meta">${meta}</span></li>`;
   });
   return `<details class="subagents">
@@ -217,6 +254,7 @@ function sessionRow(s) {
       : "";
   const branch =
     s.gitBranch && s.gitBranch !== "HEAD" ? `<div class="branch">${escapeHtml(s.gitBranch)}</div>` : "";
+  const effort = s.effort ? `<small>${escapeHtml(s.effort)} effort</small>` : "";
   const live = isLive(s) ? `<span class="badge live" title="Written to in the last 5 minutes">live</span>` : "";
   return `<tr data-id="${s.id}">
     <td>
@@ -230,10 +268,14 @@ function sessionRow(s) {
       ${branch}
     </td>
     <td>${sourceBadge(s)}${live}</td>
+    <td class="model" title="${escapeHtml(s.model)}">
+      ${escapeHtml(formatModel(s.model)) || "—"}${effort}
+    </td>
     <td class="when" title="Started ${escapeHtml(absoluteTime(s.started))}">
       ${escapeHtml(relativeTime(s.lastActive))}<small>${escapeHtml(absoluteTime(s.lastActive))}</small>
     </td>
     <td class="num">${s.messages}</td>
+    <td class="num" title="${escapeHtml(usageTitle(s))}">${formatTokens(totalTokens(s.usage))}</td>
     <td class="num">${formatSize(s.size)}</td>
     <td>
       <div class="actions">
@@ -528,7 +570,7 @@ $("#project").addEventListener("change", (e) => {
 $$(".grid th[data-sort]").forEach((th) =>
   th.addEventListener("click", () => {
     const key = th.dataset.sort;
-    state.sortDesc = state.sortKey === key ? !state.sortDesc : ["lastActive", "messages", "size"].includes(key);
+    state.sortDesc = state.sortKey === key ? !state.sortDesc : NUMERIC_SORTS.includes(key);
     state.sortKey = key;
     render();
   }),

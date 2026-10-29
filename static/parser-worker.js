@@ -19,6 +19,14 @@ const TOOL_SUMMARY_KEYS = [
   "skill",
 ];
 
+// Token counts reported in each API response's usage, under the names the UI uses.
+const USAGE_FIELDS = {
+  input: "input_tokens",
+  cacheWrite: "cache_creation_input_tokens",
+  cacheRead: "cache_read_input_tokens",
+  output: "output_tokens",
+};
+
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isNoise = (text) => NOISE_PREFIXES.some((p) => text.startsWith(p));
 const squash = (text) => text.split(/\s+/).filter(Boolean).join(" ");
@@ -70,6 +78,23 @@ function cleanPrompt(text) {
   return !text || isNoise(text) ? "" : truncate(squash(text), PROMPT_MAX);
 }
 
+const emptyUsage = () => Object.fromEntries(Object.keys(USAGE_FIELDS).map((k) => [k, 0]));
+
+function recordAssistant(info, rec, responseIds) {
+  const message = rec.message || {};
+  if (message.model && message.model !== "<synthetic>") {
+    info.model = message.model;
+    info.effort = rec.effort || "";
+  }
+  // Every content block of one API response is its own record repeating the same usage.
+  const responseId = message.id || rec.requestId;
+  if (!isObject(message.usage) || !responseId || responseIds.has(responseId)) return;
+  responseIds.add(responseId);
+  for (const [key, field] of Object.entries(USAGE_FIELDS)) {
+    if (Number.isInteger(message.usage[field])) info.usage[key] += message.usage[field];
+  }
+}
+
 function parseMeta(text) {
   const info = {
     title: "",
@@ -83,7 +108,11 @@ function parseMeta(text) {
     lastActive: "",
     userMessages: 0,
     assistantMessages: 0,
+    model: "",
+    effort: "",
+    usage: emptyUsage(),
   };
+  const responseIds = new Set();
   for (const rec of records(text)) {
     const kind = rec.type;
     if (kind === "ai-title") info.title = rec.aiTitle || info.title;
@@ -99,6 +128,7 @@ function parseMeta(text) {
     }
     if (kind === "assistant") {
       info.assistantMessages++;
+      recordAssistant(info, rec, responseIds);
       continue;
     }
     if (rec.isMeta) continue;

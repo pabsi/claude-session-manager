@@ -45,7 +45,9 @@ deployment → Source: GitHub Actions**.
 ## What it does
 
 - Lists every session in `~/.claude/projects/*/*.jsonl`, with the AI title, first prompt,
-  project, git branch, source (CLI / VS Code), last activity, message count and size.
+  project, git branch, source (CLI / VS Code), last model and effort level, last activity,
+  message count, tokens and size. Tokens are summed over every API response in the session
+  and its subagents (input, cache write, cache read and output; hover for the breakdown).
   Subagent transcripts are shown nested under their parent session.
 - Click a session title (or a subagent) to read its transcript in a side panel: your
   prompts, Claude's replies, and each tool call with its input and result (collapsed;

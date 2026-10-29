@@ -19,6 +19,12 @@ import store  # noqa: E402
 
 SID = "11111111-2222-3333-4444-555555555555"
 PROJECT = CLAUDE / "projects" / "-home-me-repo"
+USAGE = {
+    "input_tokens": 3,
+    "cache_creation_input_tokens": 100,
+    "cache_read_input_tokens": 1000,
+    "output_tokens": 20,
+}
 
 
 def write_jsonl(path, records):
@@ -37,17 +43,20 @@ def make_session():
                 "timestamp": "2026-01-01T10:00:00Z",
                 "message": {"content": "Fix the 🐛"},
             },
-            {
-                **base,
-                "type": "assistant",
-                "timestamp": "2026-01-01T10:00:05Z",
-                "message": {
-                    "content": [
-                        {"type": "text", "text": "Looking."},
-                        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
-                    ]
-                },
-            },
+            *(
+                {
+                    **base,
+                    "type": "assistant",
+                    "effort": "high",
+                    "timestamp": "2026-01-01T10:00:05Z",
+                    "message": {"id": "m1", "model": "claude-opus-5-5", "usage": USAGE, "content": [block]},
+                }
+                # One record per content block, each repeating the response's usage.
+                for block in (
+                    {"type": "text", "text": "Looking."},
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+                )
+            ),
             {
                 **base,
                 "type": "user",
@@ -59,7 +68,14 @@ def make_session():
     )
     write_jsonl(
         PROJECT / SID / "subagents" / "agent-abc.jsonl",
-        [{"type": "user", "timestamp": "2026-01-01T10:01:00Z", "message": {"content": "Explore"}}],
+        [
+            {"type": "user", "timestamp": "2026-01-01T10:01:00Z", "message": {"content": "Explore"}},
+            {
+                "type": "assistant",
+                "timestamp": "2026-01-01T10:01:05Z",
+                "message": {"id": "msg_a", "model": "claude-haiku-5-5", "usage": USAGE, "content": []},
+            },
+        ],
     )
     (PROJECT / SID / "subagents" / "agent-abc.meta.json").write_text('{"agentType": "Explore"}')
     (CLAUDE / "file-history" / SID).mkdir(parents=True, exist_ok=True)
@@ -77,7 +93,10 @@ class StoreTest(unittest.TestCase):
         [s] = store.list_sessions()
         self.assertEqual(s["title"], "Bug fix")
         self.assertEqual(s["firstPrompt"], "Fix the 🐛")
-        self.assertEqual((s["messages"], s["source"], s["gitBranch"]), (2, "cli", "main"))
+        self.assertEqual((s["messages"], s["source"], s["gitBranch"]), (3, "cli", "main"))
+        self.assertEqual((s["model"], s["effort"]), ("claude-opus-5-5", "high"))
+        # The main response counts once despite two records, plus the subagent's response.
+        self.assertEqual(s["usage"], {"input": 6, "cacheWrite": 200, "cacheRead": 2000, "output": 40})
         self.assertEqual([a["agentType"] for a in s["subagents"]], ["Explore"])
 
     def test_transcript_attaches_tool_results(self):
@@ -85,7 +104,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual([m["role"] for m in messages], ["user", "assistant"])
         tool = messages[1]["blocks"][1]
         self.assertEqual((tool["name"], tool["summary"], tool["result"]), ("Bash", "ls", "a.txt"))
-        self.assertEqual(len(store.read_transcript(SID, "abc")["messages"]), 1)
+        self.assertEqual(len(store.read_transcript(SID, "abc")["messages"]), 1)  # empty reply dropped
 
     def test_trash_restore_purge(self):
         manifest = store.trash_session(SID)

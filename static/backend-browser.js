@@ -6,6 +6,7 @@ const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const HOME_RE = /^(\/home\/[^/]+|\/Users\/[^/]+|[A-Za-z]:\\Users\\[^\\]+)/;
 const TRASH = ".csm-trash";
+const CACHE_KEY = "meta-cache-v2"; // bump when parseMeta's output changes
 
 export const canWrite = typeof window.showDirectoryPicker === "function";
 
@@ -191,6 +192,14 @@ async function treeSize(fs, path) {
   return total;
 }
 
+function sumUsage(usages) {
+  const total = { ...usages[0] };
+  for (const usage of usages.slice(1)) {
+    for (const key of Object.keys(total)) total[key] += usage[key];
+  }
+  return total;
+}
+
 function detectPlatform() {
   const p = (navigator.userAgentData?.platform || navigator.platform || "").toLowerCase();
   return p.includes("win") ? "windows" : p.includes("mac") ? "mac" : "linux";
@@ -226,7 +235,7 @@ function createBackend(fs) {
   let cache = null; // path -> {lastModified, size, info}
 
   async function metaFor(paths, files) {
-    cache ??= (await idbGet("meta-cache")) ?? {};
+    cache ??= (await idbGet(CACHE_KEY)) ?? {};
     const infos = new Array(files.length);
     const todo = [];
     files.forEach((f, i) => {
@@ -264,6 +273,7 @@ function createBackend(fs) {
           started: info.started,
           lastActive: info.lastActive,
           messages: info.userMessages + info.assistantMessages,
+          usage: info.usage,
           size: files[i].size,
         };
       }),
@@ -350,6 +360,9 @@ function createBackend(fs) {
             started: info.started,
             lastActive: info.lastActive,
             messages: info.userMessages + info.assistantMessages,
+            model: info.model,
+            effort: info.effort,
+            usage: sumUsage([info.usage, ...agents.map((a) => a.usage)]),
             size: files[i].size + dirSize,
             subagents: agents,
           };
@@ -361,7 +374,7 @@ function createBackend(fs) {
       for (const key of Object.keys(cache)) {
         if (!live.has(key) && !key.includes("/subagents/")) delete cache[key];
       }
-      idbSet("meta-cache", cache);
+      idbSet(CACHE_KEY, cache);
 
       const result = sessions.filter(Boolean).sort((a, b) => b.lastActive.localeCompare(a.lastActive));
       backend.home = guessHome(result);
