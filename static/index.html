@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Only this site's own scripts, styles and connections: the page can't send data elsewhere. -->
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; worker-src 'self'; connect-src 'self'; style-src 'self';
+             img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'"
+  >
+  <title>Claude Sessions</title>
+  <link
+    rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23c4673f'/%3E%3C/svg%3E"
+  >
+  <link rel="stylesheet" href="styles.css">
+  <script src="theme.js"></script>
+  <script src="app.js" type="module"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Claude Sessions</h1>
+    <nav class="tabs" role="tablist" id="tabs" hidden>
+      <button class="tab" role="tab" data-view="sessions" aria-selected="true"
+        >Sessions <span class="count" id="count-sessions"></span></button>
+      <button class="tab" role="tab" data-view="trash" aria-selected="false"
+        >Trash <span class="count" id="count-trash"></span></button>
+    </nav>
+    <div class="topbar-end">
+      <span class="badge readonly" id="readonly-badge" hidden
+        title="This browser can't change files: delete and trash are off">read-only</span>
+      <button class="weblink" id="change-folder" title="Open a different Claude folder" hidden></button>
+      <a class="weblink" href="https://claude.ai/recents" target="_blank" rel="noopener">claude.ai ↗</a>
+      <a class="weblink" href="https://claude.ai/code" target="_blank" rel="noopener">claude.ai/code ↗</a>
+      <button class="icon-btn" id="refresh" title="Refresh (r)" aria-label="Refresh">⟳</button>
+      <button class="icon-btn" id="theme-toggle" title="Toggle theme (t)" aria-label="Toggle theme"></button>
+    </div>
+  </header>
+
+  <main>
+    <section class="connect" id="connect" hidden>
+      <div class="connect-card">
+        <h2>Open your Claude folder</h2>
+        <p>Pick the <code>.claude</code> folder in your home directory:</p>
+        <ul class="paths">
+          <li><span>Linux / macOS</span><code>~/.claude</code></li>
+          <li><span>Windows</span><code>C:\Users\&lt;you&gt;\.claude</code></li>
+        </ul>
+        <p class="hint">
+          It's a hidden folder. In the picker press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>.</kbd> on macOS
+          or <kbd>Ctrl</kbd>+<kbd>H</kbd> on Linux to show it.
+        </p>
+        <p class="hint" id="connect-readonly-note" hidden>
+          This browser can't change local files, so the folder opens <strong>read-only</strong>: you can
+          browse and read transcripts, but not delete. Use Chrome or Edge for everything, or run
+          <code>serve.py</code>.
+        </p>
+        <p class="error" id="connect-error" hidden></p>
+        <div class="connect-actions">
+          <button class="btn primary" id="connect-reconnect" hidden></button>
+          <button class="btn" id="connect-pick">Choose folder…</button>
+          <label class="btn" id="connect-readonly" hidden>Choose folder…<input
+            type="file" id="connect-files" webkitdirectory multiple hidden></label>
+        </div>
+      </div>
+    </section>
+
+    <section class="toolbar" id="toolbar-sessions" hidden>
+      <input type="search" id="search" autocomplete="off" spellcheck="false"
+        placeholder="Search title, prompt, project, branch, id…  ( / )">
+      <div class="segmented" role="group" aria-label="Source">
+        <button data-source="all" aria-pressed="true">All</button>
+        <button data-source="cli" aria-pressed="false">CLI</button>
+        <button data-source="vscode" aria-pressed="false">VS Code</button>
+      </div>
+      <select id="project" aria-label="Project"><option value="">All projects</option></select>
+    </section>
+
+    <div class="table-wrap" id="view-sessions" hidden>
+      <table class="grid">
+        <thead>
+          <tr>
+            <th data-sort="title" class="session-col">Session</th>
+            <th data-sort="cwd">Project</th>
+            <th data-sort="source">Source</th>
+            <th data-sort="lastActive" class="sorted desc">Last active</th>
+            <th data-sort="messages" class="num">Msgs</th>
+            <th data-sort="size" class="num">Size</th>
+            <th class="actions-col"><span class="sr-only">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p class="empty" id="empty" hidden>No sessions match.</p>
+    </div>
+
+    <section class="toolbar trash-toolbar" id="toolbar-trash" hidden>
+      <span class="trash-summary" id="trash-summary"></span>
+      <button class="btn danger" id="empty-trash">Empty trash</button>
+    </section>
+
+    <div class="table-wrap" id="view-trash" hidden>
+      <table class="grid">
+        <thead>
+          <tr>
+            <th class="session-col">Session</th>
+            <th>Project</th>
+            <th>Trashed</th>
+            <th class="num">Size</th>
+            <th class="actions-col"><span class="sr-only">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody id="trash-rows"></tbody>
+      </table>
+      <p class="empty" id="trash-empty" hidden>Trash is empty.</p>
+    </div>
+  </main>
+
+  <dialog id="confirm">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-body"></p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="ok" class="btn danger" id="confirm-ok">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="viewer" class="drawer" aria-labelledby="viewer-title">
+    <header class="drawer-head">
+      <div class="drawer-heading">
+        <h2 id="viewer-title"></h2>
+        <div class="drawer-meta" id="viewer-meta"></div>
+      </div>
+      <div class="drawer-actions">
+        <button class="btn" id="viewer-tools" title="Expand or collapse all tool calls">Expand tools</button>
+        <button class="btn" id="viewer-bottom" title="Jump to latest message">Latest ↓</button>
+        <button class="btn primary" id="viewer-resume">Resume</button>
+        <button class="icon-btn" id="viewer-close" aria-label="Close" title="Close (Esc)">✕</button>
+      </div>
+    </header>
+    <div class="drawer-body" id="viewer-body"></div>
+  </dialog>
+
+  <dialog id="trust" aria-labelledby="trust-title">
+    <form method="dialog">
+      <h2 id="trust-title">Your transcripts stay on your computer</h2>
+      <div class="trust-body">
+        <p>
+          This page runs entirely in your browser. It reads (and, when you delete, changes) only the
+          folder you choose. Nothing is uploaded: the page's security policy blocks it from connecting
+          to any other site.
+        </p>
+        <p>
+          <strong>Transcripts often contain secrets</strong>: tokens, passwords, internal URLs, customer
+          data. Only give this page access if you trust the code served from this site. Whoever controls
+          the site could change that code.
+        </p>
+        <p>
+          Safer options: <a id="trust-source" target="_blank" rel="noopener" hidden>review the
+          source</a><span id="trust-source-sep" hidden>, or </span>download it and run
+          <code>serve.py</code> on your own machine.
+        </p>
+      </div>
+      <div class="dialog-actions">
+        <button value="ok" class="btn primary" autofocus>I understand</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" popover="manual"></div>
+</body>
+</html>
