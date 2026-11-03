@@ -35,6 +35,7 @@ const REJECTED_RE = new RegExp(
     "|The server-side auto mode classifier)",
 );
 const INTERRUPTED_RE = /\[Request interrupted by user/;
+const DATE_SUFFIX_RE = /-\d{8}$/;
 
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isNoise = (text) => NOISE_PREFIXES.some((p) => text.startsWith(p));
@@ -89,6 +90,33 @@ function cleanPrompt(text) {
 
 const emptyUsage = () => Object.fromEntries(Object.keys(USAGE_FIELDS).map((k) => [k, 0]));
 
+const int = (obj, key) => (isObject(obj) && Number.isInteger(obj[key]) ? obj[key] : 0);
+
+// US dollars for one API response at list price, or null when the model has no price.
+function replyCost(prices, model, usage) {
+  const price = prices[model] || prices[model.replace(DATE_SUFFIX_RE, "")];
+  if (!price) return null;
+  const write1h = int(usage.cache_creation, "ephemeral_1h_input_tokens");
+  const tokens = {
+    input: int(usage, "input_tokens"),
+    cacheWrite5m: Math.max(0, int(usage, "cache_creation_input_tokens") - write1h),
+    cacheWrite1h: write1h,
+    cacheRead: int(usage, "cache_read_input_tokens"),
+    output: int(usage, "output_tokens"),
+  };
+  const prompt = tokens.input + tokens.cacheWrite5m + tokens.cacheWrite1h + tokens.cacheRead;
+  let rates = price;
+  for (const tier of price.tiers) {
+    // ascending; a long prompt makes every token of the request dearer
+    if (prompt > tier.above) rates = { ...price, ...tier };
+  }
+  let multiplier = 1;
+  for (const key of ["speed", "inference_geo"]) multiplier *= price.multipliers[usage[key]] ?? 1;
+  const searches = int(usage.server_tool_use, "web_search_requests");
+  const cost = Object.entries(tokens).reduce((sum, [key, n]) => sum + n * rates[key], 0);
+  return cost * multiplier + searches * price.webSearch;
+}
+
 function toolOutcome(block, rec) {
   const text = toolResultText(block.content).trim();
   if (INTERRUPTED_RE.test(text) || (isObject(rec.toolUseResult) && rec.toolUseResult.interrupted)) {
@@ -122,7 +150,7 @@ function countModel(models, model, effort) {
   else models.push({ model, effort, responses: 1 });
 }
 
-function recordAssistant(info, rec, responseIds, toolCalls) {
+function recordAssistant(info, rec, responseIds, toolCalls, prices) {
   const message = rec.message || {};
   for (const b of Array.isArray(message.content) ? message.content : []) {
     if (isObject(b) && b.type === "tool_use") toolCalls.add(b.id);
@@ -142,9 +170,14 @@ function recordAssistant(info, rec, responseIds, toolCalls) {
       info.usage[key] += message.usage[field];
     }
   }
+  if (realModel && isObject(message.usage)) {
+    const cost = replyCost(prices, message.model, message.usage);
+    if (cost === null) info.cost.unpriced++;
+    else info.cost.usd += cost;
+  }
 }
 
-function parseMeta(text) {
+function parseMeta(text, prices) {
   const info = {
     title: "",
     customTitle: "",
@@ -160,6 +193,7 @@ function parseMeta(text) {
     model: "",
     effort: "",
     usage: emptyUsage(),
+    cost: { usd: 0, unpriced: 0 }, // unpriced: replies whose model has no price
     models: [], // {model, effort, responses} in order of first use
     compactions: { manual: 0, auto: 0 },
   };
@@ -184,7 +218,7 @@ function parseMeta(text) {
     }
     if (kind === "assistant") {
       info.assistantMessages++;
-      recordAssistant(info, rec, responseIds, toolCalls);
+      recordAssistant(info, rec, responseIds, toolCalls, prices);
       continue;
     }
     if (rec.isMeta) continue;
@@ -192,7 +226,9 @@ function parseMeta(text) {
     recordToolResults(rec, content, outcomes);
     // Tool results come back as user records; only count real prompts.
     const onlyToolResults =
-      Array.isArray(content) && content.length && content.every((b) => isObject(b) && b.type === "tool_result");
+      Array.isArray(content) &&
+      content.length &&
+      content.every((b) => isObject(b) && b.type === "tool_result");
     if (onlyToolResults) continue;
     info.userMessages++;
     if (info.firstPrompt) continue;
@@ -304,13 +340,13 @@ function parseTranscript(text) {
   return { messages };
 }
 
-// {id, kind: "meta", files} -> {id, result: info[]}
+// {id, kind: "meta", files, prices} -> {id, result: info[]}  (prices: the price list's models)
 // {id, kind: "transcript", file} -> {id, result: {messages}}
 self.onmessage = async ({ data }) => {
   try {
     const result =
       data.kind === "meta"
-        ? await Promise.all(data.files.map(async (f) => parseMeta(await f.text())))
+        ? await Promise.all(data.files.map(async (f) => parseMeta(await f.text(), data.prices || {})))
         : parseTranscript(await data.file.text());
     self.postMessage({ id: data.id, result });
   } catch (err) {

@@ -1,0 +1,64 @@
+# Install once with `pre-commit install`; run everything with `pre-commit run --all-files`.
+# The Node hooks get their own Node.js (nodeenv), so no local Node or node_modules is needed.
+default_language_version:
+  node: 24.22.1
+
+exclude: ^static/prices\.json$
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: trailing-whitespace
+
+  # Credentials leak detection
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+
+  # Python: lint and format (settings in ruff.toml)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # JavaScript, CSS and HTML
+  - repo: local
+    hooks:
+      - id: prettier
+        name: prettier (format JS, CSS, HTML)
+        entry: prettier --write --ignore-unknown
+        language: node
+        types_or: [javascript, css, html]
+        additional_dependencies: [prettier@3.9.10]
+      - id: eslint
+        name: eslint (lint JS)
+        entry: eslint --max-warnings=0
+        language: node
+        types: [javascript]
+        additional_dependencies: [eslint@10.13.0, "@eslint/js@10.0.1", globals@17.13.0]
+      - id: stylelint
+        name: stylelint (lint CSS)
+        entry: stylelint --fix
+        language: node
+        types: [css]
+        additional_dependencies: [stylelint@17.16.0, stylelint-config-standard@40.0.0]
+      - id: html-validate
+        name: html-validate (lint HTML)
+        entry: html-validate
+        language: node
+        types: [html]
+        additional_dependencies: [html-validate@11.16.4]

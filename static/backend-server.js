@@ -28,6 +28,7 @@ export async function connectServer() {
     writable: true,
     platform: info.platform,
     home: info.home,
+    prices: info.prices, // {source, fetched} of the price list costs are based on, or null
     listSessions: () => api("GET", "/api/sessions"),
     readTranscript: (id, agentId) => api("GET", transcriptPath(id, agentId)),
     listTrash: () => api("GET", "/api/trash"),

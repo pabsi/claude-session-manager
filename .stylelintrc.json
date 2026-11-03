@@ -1,0 +1,9 @@
+{
+  "extends": "stylelint-config-standard",
+  "rules": {
+    "alpha-value-notation": "number",
+    "media-feature-range-notation": "prefix",
+    "no-descending-specificity": null,
+    "value-keyword-case": ["lower", { "ignoreProperties": ["/^--/"] }]
+  }
+}

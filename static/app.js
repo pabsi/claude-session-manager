@@ -11,7 +11,7 @@ const TIME_UNITS = [
   ["hour", 3600],
   ["minute", 60],
 ];
-const NUMERIC_SORTS = ["lastActive", "messages", "tokens", "size"];
+const NUMERIC_SORTS = ["lastActive", "messages", "tokens", "size", "trashedAt"]; // first click: high to low
 const USAGE_LABELS = { input: "Input", cacheWrite: "Cache write", cacheRead: "Cache read", output: "Output" };
 const TOKEN_ROWS = [...Object.entries(USAGE_LABELS), [null, "Total", "total"]]; // null key: sum of the column
 const TOOL_ROWS = [
@@ -22,6 +22,10 @@ const TOOL_ROWS = [
   ["rejected", "Rejected", "part"],
 ];
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const TRASH_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none"
+  stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.7 9.5h6.6L12 4M6.75 7v4M9.25 7v4"/>
+</svg>`;
 
 let backend = null;
 
@@ -34,11 +38,13 @@ const state = {
   query: "",
   source: "all",
   project: "",
-  sortKey: "lastActive",
-  sortDesc: true,
-  selected: new Set(),
-  visibleIds: [],
-  anchorId: null, // last row clicked, the start of a Shift+click range
+  sort: { sessions: { key: "lastActive", desc: true }, trash: { key: "trashedAt", desc: true } },
+  // Per tab; anchorId is the last row clicked, the start of a Shift+click range.
+  selection: {
+    sessions: { selected: new Set(), visibleIds: [], anchorId: null },
+    trash: { selected: new Set(), visibleIds: [], anchorId: null },
+  },
+  progress: null, // { done, total, label, view } while a batch runs
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -53,7 +59,12 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 // At most `max` characters, counting an emoji as one so it's never cut in half.
 function crop(text, max) {
   const chars = Array.from(text);
-  return chars.length <= max ? text : chars.slice(0, max - 1).join("").trimEnd() + "…";
+  return chars.length <= max
+    ? text
+    : chars
+        .slice(0, max - 1)
+        .join("")
+        .trimEnd() + "…";
 }
 
 function shortPath(p) {
@@ -104,15 +115,51 @@ function subagentSum(s, field) {
   );
 }
 
+// Claude Code's own figure when it covers the whole session, otherwise the transcript at list price.
+function sessionCost(s) {
+  const { usd, unpriced } = s.cost;
+  // Claude Code's total also covers calls it doesn't write to the transcript, so it is at least the
+  // transcript's; a lower one is from an earlier run and misses part of the session.
+  if (s.recordedCost != null && s.recordedCost >= usd) return { usd: s.recordedCost, recorded: true };
+  if (!backend.prices || (unpriced && !usd)) return null;
+  return { usd, recorded: false, unpriced };
+}
+
+function formatCost(usd) {
+  if (usd === 0) return "$0";
+  if (usd < 0.01) return "<$0.01";
+  return usd < 10 ? `$${usd.toFixed(2)}` : `$${Math.round(usd).toLocaleString()}`;
+}
+
+function costLines(cost) {
+  const exact = `$${cost.usd.toFixed(cost.usd < 1 ? 4 : 2)}`;
+  if (cost.recorded) return [`Cost: ${exact}, recorded by Claude Code`];
+  const lines = [
+    `Cost: at least ${exact} at API list price`,
+    "(calls Claude Code doesn't write to the transcript aren't included)",
+  ];
+  if (cost.unpriced) {
+    lines.push(`${plural(cost.unpriced, "reply")} not priced: model missing from the price list`);
+  }
+  lines.push(`Prices: LiteLLM, fetched ${absoluteTime(backend.prices.fetched)}`);
+  return lines;
+}
+
 function usageTitle(s) {
   const lines = Object.entries(USAGE_LABELS).map(([k, label]) => `${label}: ${s.usage[k].toLocaleString()}`);
   if (s.subagents.length) lines.push("Includes subagents");
+  const cost = sessionCost(s);
+  if (cost) lines.push("", ...costLines(cost));
   return lines.join("\n");
 }
 
 // "claude-opus-5-5" -> "Opus 5.5", "claude-sonnet-4-5-20250929" -> "Sonnet 4.5"
 function formatModel(id) {
-  const parts = (id || "").replace(/^claude-/, "").replace(/-\d{8}$/, "").split("-").filter(Boolean);
+  const parts = (id || "")
+    .replace(/^claude-/, "")
+    .replace(/-\d{8}$/, "")
+    .split("-")
+    .filter(Boolean);
   const name = parts.filter((p) => !/^\d+$/.test(p));
   const version = parts.filter((p) => /^\d+$/.test(p));
   if (!name.length) return id || "";
@@ -199,8 +246,14 @@ async function reload() {
     state.home = backend.home;
     state.sessions = sessions;
     state.trash = trash;
-    const ids = new Set(sessions.map((s) => s.id));
-    state.selected = new Set([...state.selected].filter((id) => ids.has(id)));
+    for (const [view, list] of [
+      ["sessions", sessions],
+      ["trash", trash],
+    ]) {
+      const ids = new Set(list.map((x) => x.id));
+      const sel = selection(view);
+      sel.selected = new Set([...sel.selected].filter((id) => ids.has(id)));
+    }
     renderProjects();
     render();
   } catch (err) {
@@ -238,13 +291,19 @@ function filteredSessions() {
       (!state.project || s.cwd === state.project) &&
       terms.every((t) => searchText(s).includes(t)),
   );
-  const { sortKey: key, sortDesc: desc } = state;
+  const { key } = state.sort.sessions;
   const value = (s) => {
     if (key === "title") return s.title || s.firstPrompt;
     if (key === "tokens") return totalTokens(s.usage);
     if (key === "model") return formatModel(s.model);
     return s[key];
   };
+  return sortRows(rows, state.sort.sessions, value);
+}
+
+const sortedTrash = () => sortRows([...state.trash], state.sort.trash, (t) => t[state.sort.trash.key]);
+
+function sortRows(rows, { desc }, value) {
   return rows.sort((a, b) => {
     const [va, vb] = [value(a), value(b)];
     const cmp = typeof va === "number" ? va - vb : String(va ?? "").localeCompare(String(vb ?? ""));
@@ -282,8 +341,12 @@ function sessionRow(s) {
   const branch =
     s.gitBranch && s.gitBranch !== "HEAD" ? `<div class="branch">${escapeHtml(s.gitBranch)}</div>` : "";
   const effort = s.effort ? `<small>${escapeHtml(s.effort)} effort</small>` : "";
-  const live = isLive(s) ? `<span class="badge live" title="Written to in the last 5 minutes">live</span>` : "";
-  const selected = state.selected.has(s.id);
+  const live = isLive(s)
+    ? `<span class="badge live" title="Written to in the last 5 minutes">live</span>`
+    : "";
+  const usd = sessionCost(s)?.usd;
+  const cost = usd === undefined ? "" : ` / ${formatCost(usd)}`;
+  const selected = selection("sessions").selected.has(s.id);
   return `<tr data-id="${s.id}"${selected ? ' class="selected"' : ""}>
     <td class="select-cell">
       <input type="checkbox" class="row-select" aria-label="Select session"${selected ? " checked" : ""}>
@@ -306,19 +369,25 @@ function sessionRow(s) {
       ${escapeHtml(relativeTime(s.lastActive))}<small>${escapeHtml(absoluteTime(s.lastActive))}</small>
     </td>
     <td class="num">${s.messages}</td>
-    <td class="num" title="${escapeHtml(usageTitle(s))}">${formatTokens(totalTokens(s.usage))}</td>
+    <td class="num" title="${escapeHtml(usageTitle(s))}">${formatTokens(totalTokens(s.usage))}${cost}</td>
     <td class="num">${formatSize(s.size)}</td>
     <td>
       <div class="actions">
         <button class="btn primary" data-action="resume" title="Copy resume command">Resume</button>
         <button class="btn" data-action="details">Details</button>
+        <button class="btn danger icon trash-btn" data-action="trash" title="Move to trash"
+          aria-label="Move to trash">${TRASH_ICON}</button>
       </div>
     </td>
   </tr>`;
 }
 
 function trashRow(t) {
-  return `<tr data-id="${t.id}">
+  const selected = selection("trash").selected.has(t.id);
+  return `<tr data-id="${t.id}"${selected ? ' class="selected"' : ""}>
+    <td class="select-cell">
+      <input type="checkbox" class="row-select" aria-label="Select session"${selected ? " checked" : ""}>
+    </td>
     <td>
       <div class="title">${escapeHtml(t.title || "(no prompt)")}</div>
       <div class="sid">${t.id}</div>
@@ -339,11 +408,13 @@ function trashRow(t) {
 
 function render() {
   const rows = filteredSessions();
-  state.visibleIds = rows.map((s) => s.id);
+  selection("sessions").visibleIds = rows.map((s) => s.id);
+  const trash = sortedTrash();
+  selection("trash").visibleIds = trash.map((t) => t.id);
   $("#rows").innerHTML = rows.map(sessionRow).join("");
   $("#empty").hidden = rows.length > 0;
   syncSelection();
-  $("#trash-rows").innerHTML = state.trash.map(trashRow).join("");
+  $("#trash-rows").innerHTML = trash.map(trashRow).join("");
   $("#trash-empty").hidden = state.trash.length > 0;
 
   const total = state.sessions.length;
@@ -355,10 +426,12 @@ function render() {
     : "";
   $("#empty-trash").disabled = state.trash.length === 0;
 
-  $$(".grid th[data-sort]").forEach((th) => {
-    th.classList.toggle("sorted", th.dataset.sort === state.sortKey);
-    th.classList.toggle("desc", th.dataset.sort === state.sortKey && state.sortDesc);
-  });
+  for (const [view, sort] of Object.entries(state.sort)) {
+    $$(`#view-${view} th[data-sort]`).forEach((th) => {
+      th.classList.toggle("sorted", th.dataset.sort === sort.key);
+      th.classList.toggle("desc", th.dataset.sort === sort.key && sort.desc);
+    });
+  }
 }
 
 function setView(view) {
@@ -368,58 +441,120 @@ function setView(view) {
   $("#view-sessions").hidden = $("#toolbar-sessions").hidden = view !== "sessions";
   $("#view-trash").hidden = $("#toolbar-trash").hidden = view !== "trash";
   syncSelection();
+  syncProgress();
 }
 
 // ---------- selection ----------
 
+// Each tab keeps its own selection; the selection bar and keys act on the one in view.
+const SELECTABLE = {
+  sessions: { rows: "#rows", all: "#select-all" },
+  trash: { rows: "#trash-rows", all: "#trash-select-all" },
+};
+
+const selection = (view = state.view) => state.selection[view];
+
 // Updates checkboxes and the selection bar in place, so expanded rows stay expanded.
 function syncSelection() {
-  const { selected, visibleIds } = state;
-  for (const tr of $("#rows").children) {
-    const on = selected.has(tr.dataset.id);
-    tr.classList.toggle("selected", on);
-    tr.querySelector(".row-select").checked = on;
+  for (const [view, { rows, all }] of Object.entries(SELECTABLE)) {
+    const { selected, visibleIds } = selection(view);
+    for (const tr of $(rows).children) {
+      const on = selected.has(tr.dataset.id);
+      tr.classList.toggle("selected", on);
+      tr.querySelector(".row-select").checked = on;
+    }
+    const shown = visibleIds.filter((id) => selected.has(id)).length;
+    $(all).checked = shown > 0 && shown === visibleIds.length;
+    $(all).indeterminate = shown > 0 && shown < visibleIds.length;
   }
-  const shown = visibleIds.filter((id) => selected.has(id)).length;
-  $("#select-all").checked = shown > 0 && shown === visibleIds.length;
-  $("#select-all").indeterminate = shown > 0 && shown < visibleIds.length;
 
-  $("#selection-bar").hidden = state.view !== "sessions" || selected.size === 0 || !backend?.writable;
-  const filteredOut = selected.size - shown;
+  const { selected, visibleIds } = selection();
+  $("#selection-bar").hidden = selected.size === 0 || !backend?.writable;
+  const filteredOut = selected.size - visibleIds.filter((id) => selected.has(id)).length;
   $("#selection-count").textContent =
     `${selected.size} selected` + (filteredOut ? ` (${filteredOut} hidden by filters)` : "");
-  $("#delete-selected").textContent = `Delete ${plural(selected.size, "session")}`;
+  const restoring = state.view === "trash";
+  $("#bulk-action").textContent = `${restoring ? "Restore" : "Delete"} ${plural(selected.size, "session")}`;
+  $("#bulk-action").classList.toggle("danger", !restoring);
 }
 
 function rangeIds(from, to) {
-  const a = state.visibleIds.indexOf(from);
-  const b = state.visibleIds.indexOf(to);
+  const { visibleIds } = selection();
+  const a = visibleIds.indexOf(from);
+  const b = visibleIds.indexOf(to);
   if (a < 0 || b < 0) return [to];
-  return state.visibleIds.slice(Math.min(a, b), Math.max(a, b) + 1);
+  return visibleIds.slice(Math.min(a, b), Math.max(a, b) + 1);
 }
 
 function toggleRow(cell, e) {
+  const sel = selection();
   const input = cell.querySelector(".row-select");
   if (e.target !== input) input.checked = !input.checked; // a click on the cell around the box
   const id = cell.closest("tr").dataset.id;
-  const ids = e.shiftKey && state.anchorId ? rangeIds(state.anchorId, id) : [id];
+  const ids = e.shiftKey && sel.anchorId ? rangeIds(sel.anchorId, id) : [id];
   for (const x of ids) {
-    if (input.checked) state.selected.add(x);
-    else state.selected.delete(x);
+    if (input.checked) sel.selected.add(x);
+    else sel.selected.delete(x);
   }
-  state.anchorId = id;
+  sel.anchorId = id;
   if (e.shiftKey) getSelection()?.removeAllRanges(); // Shift+click also selects page text
   syncSelection();
 }
 
 function clearSelection() {
-  state.selected.clear();
-  state.anchorId = null;
+  selection().selected.clear();
+  selection().anchorId = null;
   syncSelection();
 }
 
-async function deleteSelected() {
-  const chosen = state.sessions.filter((s) => state.selected.has(s.id));
+// ---------- batches ----------
+
+// Shown only while a batch runs, and only on the tab that started it.
+function syncProgress() {
+  const p = state.progress;
+  $("#progress").hidden = !p || p.view !== state.view;
+  if (!p) return;
+  $("#progress-bar").max = p.total;
+  $("#progress-bar").value = p.done;
+  $("#progress-label").textContent = p.label(p.done, p.total);
+}
+
+// Runs `fn` on each item in turn, with a progress bar for more than one. Returns the failures.
+async function runBatch(items, button, label, fn) {
+  const failed = [];
+  if (items.length > 1) state.progress = { done: 0, total: items.length, label, view: state.view };
+  syncProgress();
+  await withBusy(button, async () => {
+    for (const item of items) {
+      try {
+        await fn(item);
+      } catch (err) {
+        failed.push(`${item.title || item.id}: ${err.message}`);
+      }
+      if (state.progress) state.progress.done++;
+      syncProgress();
+    }
+  });
+  state.progress = null;
+  syncProgress();
+  return failed;
+}
+
+function bulkAction() {
+  const { selected } = selection();
+  if (state.view === "trash") {
+    return restoreSessions(
+      state.trash.filter((t) => selected.has(t.id)),
+      $("#bulk-action"),
+    );
+  }
+  return trashSessions(
+    state.sessions.filter((s) => selected.has(s.id)),
+    $("#bulk-action"),
+  );
+}
+
+async function trashSessions(chosen, button) {
   if (!chosen.length) return;
   const names = chosen.slice(0, 5).map((s) => `• ${crop(s.title || s.firstPrompt || s.id, NAME_MAX)}`);
   if (chosen.length > 5) names.push(`…and ${chosen.length - 5} more`);
@@ -437,24 +572,32 @@ async function deleteSelected() {
     "Move to trash",
   );
   if (!ok) return;
-  const failed = [];
-  await withBusy($("#delete-selected"), async () => {
-    for (const s of chosen) {
-      try {
-        const manifest = await backend.trashSession(s.id);
-        state.trash.unshift({ ...manifest, size: s.size });
-        state.sessions = state.sessions.filter((x) => x.id !== s.id);
-        state.selected.delete(s.id);
-      } catch (err) {
-        failed.push(`${s.title || s.id}: ${err.message}`);
-      }
-    }
+  const label = (done, total) => `Moved ${done} of ${total} to trash…`;
+  const failed = await runBatch(chosen, button, label, async (s) => {
+    const manifest = await backend.trashSession(s.id);
+    state.trash.unshift({ ...manifest, size: s.size });
+    state.sessions = state.sessions.filter((x) => x.id !== s.id);
+    selection("sessions").selected.delete(s.id);
   });
   renderProjects();
   render();
   const moved = chosen.length - failed.length;
   if (failed.length) toast(`Moved ${moved} to trash. Failed: ${escapeHtml(failed.join("; "))}`, true);
   else toast(`Moved ${plural(moved, "session")} to trash`);
+}
+
+async function restoreSessions(chosen, button) {
+  if (!chosen.length) return;
+  const label = (done, total) => `Restored ${done} of ${total}…`;
+  const failed = await runBatch(chosen, button, label, async (t) => {
+    await backend.restoreSession(t.id);
+    state.trash = state.trash.filter((x) => x.id !== t.id);
+    selection("trash").selected.delete(t.id);
+  });
+  const restored = chosen.length - failed.length;
+  if (failed.length) toast(`Restored ${restored}. Failed: ${escapeHtml(failed.join("; "))}`, true);
+  else toast(`Restored ${plural(restored, "session")}`);
+  await load();
 }
 
 // ---------- details ----------
@@ -525,6 +668,11 @@ function openDetails(s) {
     ? `<small>+ ${subCount} in ${plural(s.subagents.length, "subagent")}</small>`
     : "";
   const total = totalTokens(s.usage);
+  const cost = sessionCost(s);
+  const costStat = cost
+    ? `<div title="${escapeHtml(costLines(cost).join("\n"))}"><dt>Cost</dt><dd>${formatCost(cost.usd)}
+        <small>${cost.recorded ? "recorded by Claude Code" : "at least, at list price"}</small></dd></div>`
+    : "";
 
   const name = s.title || s.firstPrompt || s.id;
   $("#details-title").textContent = crop(name, NAME_MAX);
@@ -535,6 +683,7 @@ function openDetails(s) {
       <div><dt>Messages</dt><dd>${n(s.messages)}${subMessages}</dd></div>
       <div><dt>Tokens</dt><dd>${formatTokens(total)}<small>${n(total)}</small></dd></div>
       <div><dt>Size</dt><dd>${formatSize(s.size)}<small>${n(s.size)} bytes</small></dd></div>
+      ${costStat}
     </dl>
     <h3>Token consumption</h3>
     ${breakdownTable(s, "usage", TOKEN_ROWS, "Tokens")}
@@ -670,7 +819,10 @@ const actions = {
 
   viewAgent(id, el) {
     const s = findSession(id);
-    openViewer(s, s.subagents.find((a) => a.agentId === el.dataset.agent));
+    openViewer(
+      s,
+      s.subagents.find((a) => a.agentId === el.dataset.agent),
+    );
   },
 
   async resume(id) {
@@ -683,12 +835,12 @@ const actions = {
     openDetails(findSession(id));
   },
 
-  async restore(id, button) {
-    await withBusy(button, async () => {
-      await backend.restoreSession(id);
-      toast("Restored");
-      await load();
-    });
+  trash(id, button) {
+    return trashSessions([findSession(id)], button);
+  },
+
+  restore(id, button) {
+    return restoreSessions([state.trash.find((t) => t.id === id)], button);
   },
 
   async purge(id, button) {
@@ -702,6 +854,7 @@ const actions = {
     await withBusy(button, async () => {
       await backend.purgeSession(id);
       state.trash = state.trash.filter((x) => x.id !== id);
+      selection("trash").selected.delete(id);
       render();
       toast("Deleted");
     });
@@ -718,6 +871,7 @@ async function emptyTrash() {
   await withBusy($("#empty-trash"), async () => {
     const { deleted } = await backend.emptyTrash();
     state.trash = [];
+    selection("trash").selected.clear();
     toast(`Deleted ${plural(deleted, "session")}`);
   });
   render();
@@ -764,29 +918,32 @@ $("#project").addEventListener("change", (e) => {
 
 $$(".grid th[data-sort]").forEach((th) =>
   th.addEventListener("click", () => {
+    const sort = state.sort[th.closest(".table-wrap").id.replace("view-", "")];
     const key = th.dataset.sort;
-    state.sortDesc = state.sortKey === key ? !state.sortDesc : NUMERIC_SORTS.includes(key);
-    state.sortKey = key;
+    sort.desc = sort.key === key ? !sort.desc : NUMERIC_SORTS.includes(key);
+    sort.key = key;
     render();
   }),
 );
 
 $$(".tab").forEach((t) => t.addEventListener("click", () => setView(t.dataset.view)));
-$("#rows").addEventListener("click", (e) => {
-  const cell = e.target.closest(".select-cell");
-  if (cell) toggleRow(cell, e);
-  else onTableClick(e);
-});
-$("#select-all").addEventListener("change", (e) => {
-  for (const id of state.visibleIds) {
-    if (e.target.checked) state.selected.add(id);
-    else state.selected.delete(id);
-  }
-  syncSelection();
-});
-$("#delete-selected").addEventListener("click", deleteSelected);
+for (const { rows, all } of Object.values(SELECTABLE)) {
+  $(rows).addEventListener("click", (e) => {
+    const cell = e.target.closest(".select-cell");
+    if (cell) toggleRow(cell, e);
+    else onTableClick(e);
+  });
+  $(all).addEventListener("change", (e) => {
+    const { selected, visibleIds } = selection();
+    for (const id of visibleIds) {
+      if (e.target.checked) selected.add(id);
+      else selected.delete(id);
+    }
+    syncSelection();
+  });
+}
+$("#bulk-action").addEventListener("click", bulkAction);
 $("#clear-selection").addEventListener("click", clearSelection);
-$("#trash-rows").addEventListener("click", onTableClick);
 $("#theme-toggle").addEventListener("click", toggleTheme);
 $("#refresh").addEventListener("click", load);
 $("#empty-trash").addEventListener("click", emptyTrash);
@@ -819,7 +976,7 @@ document.addEventListener("keydown", (e) => {
   }
   const typing = e.target.matches("input:not([type=checkbox]), select, textarea");
   if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
-  if (e.key === "Escape" && state.selected.size) {
+  if (e.key === "Escape" && selection().selected.size) {
     clearSelection();
   } else if (e.key === "/") {
     e.preventDefault();

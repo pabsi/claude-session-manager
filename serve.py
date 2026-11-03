@@ -14,9 +14,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import prices
 import store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+PRICES_FILE = STATIC_DIR / "prices.json"  # also served, for the browser-only mode
 HOST = "127.0.0.1"
 # Not from mimetypes: on Windows it reads the registry, which may map .js to text/plain,
 # and browsers refuse to run such scripts under "nosniff".
@@ -29,8 +31,18 @@ CONTENT_TYPES = {
 }
 PLATFORM = {"win32": "windows", "darwin": "mac"}.get(sys.platform, "linux")
 
+
+def _info():
+    price_list = store.PRICE_LIST
+    return {
+        "platform": PLATFORM,
+        "home": str(Path.home()),
+        "prices": price_list and {"source": price_list["source"], "fetched": price_list["fetched"]},
+    }
+
+
 ROUTES = [
-    ("GET", re.compile(r"^/api/info$"), lambda m: {"platform": PLATFORM, "home": str(Path.home())}),
+    ("GET", re.compile(r"^/api/info$"), lambda m: _info()),
     ("GET", re.compile(r"^/api/sessions$"), lambda m: store.list_sessions()),
     ("GET", re.compile(r"^/api/sessions/([^/]+)/transcript$"), lambda m: store.read_transcript(m[1])),
     (
@@ -127,6 +139,11 @@ def main():
 
     if moved := store.migrate_legacy_trash():
         print(f"Moved {moved} trashed session(s) to {store.TRASH_DIR}")
+    store.PRICE_LIST, error = prices.refresh(PRICES_FILE)
+    if error:
+        saved = store.PRICE_LIST
+        fallback = f"using the list from {saved['fetched'][:10]}" if saved else "costs are not shown"
+        print(f"Couldn't update API prices ({error}); {fallback}")
     store.list_sessions()  # warm the cache
     server = ThreadingHTTPServer((HOST, args.port), Handler)
     url = f"http://{HOST}:{args.port}/"

@@ -6,7 +6,7 @@ const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const HOME_RE = /^(\/home\/[^/]+|\/Users\/[^/]+|[A-Za-z]:\\Users\\[^\\]+)/;
 const TRASH = ".csm-trash";
-const CACHE_KEY = "meta-cache-v4"; // bump when parseMeta's output changes
+const CACHE_KEY = "meta-cache-v5"; // bump when parseMeta's output changes
 
 export const canWrite = typeof window.showDirectoryPicker === "function";
 
@@ -33,6 +33,18 @@ async function idb(mode, fn) {
 }
 const idbGet = (key) => idb("readonly", (s) => s.get(key)).catch(() => undefined);
 const idbSet = (key, value) => idb("readwrite", (s) => s.put(value, key)).catch(() => {});
+
+// ---------- prices ----------
+
+// The price list deployed next to the page (see prices.py), or null without one.
+let priceList;
+function loadPrices() {
+  priceList ??= fetch(new URL("prices.json", import.meta.url))
+    .then((res) => (res.ok ? res.json() : null))
+    .then((list) => (list && typeof list.models === "object" ? list : null))
+    .catch(() => null);
+  return priceList;
+}
 
 // ---------- parser worker ----------
 
@@ -224,6 +236,8 @@ function relativeToRoot(from, rootName) {
   return p.slice(i + rootName.length + 2);
 }
 
+const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
 function checkId(id, re = SESSION_ID_RE) {
   if (!re.test(id)) throw new Error("invalid id");
 }
@@ -236,21 +250,38 @@ function createBackend(fs) {
 
   async function metaFor(paths, files) {
     cache ??= (await idbGet(CACHE_KEY)) ?? {};
+    const list = await loadPrices();
+    const pricedAt = list?.fetched ?? ""; // costs in the cache are only as new as their prices
     const infos = new Array(files.length);
     const todo = [];
     files.forEach((f, i) => {
       const hit = cache[paths[i]];
-      if (hit && hit.lastModified === f.lastModified && hit.size === f.size) infos[i] = hit.info;
+      const fresh = hit && hit.lastModified === f.lastModified && hit.size === f.size;
+      if (fresh && hit.pricedAt === pricedAt) infos[i] = hit.info;
       else todo.push(i);
     });
     if (todo.length) {
-      const parsed = await parse({ kind: "meta", files: todo.map((i) => files[i]) });
+      const parsed = await parse({ kind: "meta", files: todo.map((i) => files[i]), prices: list?.models });
       todo.forEach((i, j) => {
         infos[i] = parsed[j];
-        cache[paths[i]] = { lastModified: files[i].lastModified, size: files[i].size, info: parsed[j] };
+        const f = files[i];
+        cache[paths[i]] = { lastModified: f.lastModified, size: f.size, pricedAt, info: parsed[j] };
       });
     }
     return infos;
+  }
+
+  // Claude Code's own cost of the last session in each project, by session id. Its config is
+  // only inside the Claude folder when CLAUDE_CONFIG_DIR is set; otherwise it's out of reach.
+  async function recordedCosts() {
+    const costs = new Map();
+    try {
+      const projects = JSON.parse(await (await fs.file(".claude.json")).text()).projects;
+      for (const p of Object.values(isObject(projects) ? projects : {})) {
+        if (isObject(p) && typeof p.lastCost === "number") costs.set(p.lastSessionId, p.lastCost);
+      }
+    } catch {}
+    return costs;
   }
 
   async function subagents(sessionDir) {
@@ -274,6 +305,7 @@ function createBackend(fs) {
           lastActive: info.lastActive,
           messages: info.userMessages + info.assistantMessages,
           usage: info.usage,
+          cost: info.cost,
           tools: info.tools,
           models: info.models,
           compactions: info.compactions,
@@ -320,10 +352,12 @@ function createBackend(fs) {
     folderName: fs.name,
     platform: detectPlatform(),
     home: "",
+    prices: null, // {source, fetched} of the price list costs are based on
 
     async validate() {
       if ((await fs.kind("projects")) !== "directory") {
-        const hint = fs.name === "projects" ? " You picked the projects folder; pick its parent, .claude." : "";
+        const hint =
+          fs.name === "projects" ? " You picked the projects folder; pick its parent, .claude." : "";
         throw new Error(`“${fs.name}” has no projects folder, so it isn't a Claude folder.${hint}`);
       }
     },
@@ -342,7 +376,15 @@ function createBackend(fs) {
         }),
       );
       const files = await Promise.all(found.map((f) => fs.file(f.path)));
-      const infos = await metaFor(found.map((f) => f.path), files);
+      const [infos, recorded, list] = await Promise.all([
+        metaFor(
+          found.map((f) => f.path),
+          files,
+        ),
+        recordedCosts(),
+        loadPrices(),
+      ]);
+      backend.prices = list && { source: list.source, fetched: list.fetched };
 
       transcripts.clear();
       const sessions = await Promise.all(
@@ -366,6 +408,8 @@ function createBackend(fs) {
             model: info.model,
             effort: info.effort,
             usage: sumCounts([info.usage, ...agents.map((a) => a.usage)]),
+            cost: sumCounts([info.cost, ...agents.map((a) => a.cost)]),
+            recordedCost: recorded.get(f.id) ?? null,
             tools: sumCounts([info.tools, ...agents.map((a) => a.tools)]),
             models: info.models,
             compactions: sumCounts([info.compactions, ...agents.map((a) => a.compactions)]),
@@ -429,7 +473,7 @@ function createBackend(fs) {
       } catch (err) {
         for (const item of items.reverse()) await fs.move(`${dest}/${item.to}`, item.from);
         await fs.remove(dest).catch(() => {});
-        throw new Error(`${err.message} (is the session still open?)`);
+        throw new Error(`${err.message} (is the session still open?)`, { cause: err });
       }
       const manifest = {
         id,

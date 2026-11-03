@@ -15,3 +15,7 @@ node_modules/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Downloaded by prices.py (serve.py, the Pages workflow)
+static/prices.json
+static/prices.tmp

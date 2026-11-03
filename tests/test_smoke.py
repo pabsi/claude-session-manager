@@ -14,6 +14,7 @@ CLAUDE = Path(TMP.name) / ".claude"
 os.environ["CLAUDE_CONFIG_DIR"] = str(CLAUDE)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import prices  # noqa: E402
 import serve  # noqa: E402
 import store  # noqa: E402
 
@@ -102,6 +103,89 @@ def make_session():
     )
     (PROJECT / SID / "subagents" / "agent-abc.meta.json").write_text('{"agentType": "Explore"}')
     (CLAUDE / "file-history" / SID).mkdir(parents=True, exist_ok=True)
+
+
+RATES = {"input": 1e-6, "cacheWrite5m": 2e-6, "cacheWrite1h": 4e-6, "cacheRead": 1e-7, "output": 5e-6}
+PRICE = {**RATES, "webSearch": 0.01, "multipliers": {"fast": 2, "us": 1.1}, "tiers": []}
+
+
+class CostTest(unittest.TestCase):
+    def setUp(self):
+        make_session()
+        store.PRICE_LIST = {"models": {"claude-opus-5-5": PRICE, "claude-sonnet-5-5": PRICE}}
+        store._cache.clear()
+
+    def tearDown(self):
+        store.PRICE_LIST = None
+        store._cache.clear()
+        store.CONFIG_FILE.unlink(missing_ok=True)
+
+    def test_session_cost(self):
+        [s] = store.list_sessions()
+        # The opus reply (3 input, 100 cache write, 1000 cache read, 20 output); the subagent's
+        # haiku reply has no price.
+        self.assertAlmostEqual(s["cost"]["usd"], 3e-6 + 2e-4 + 1e-4 + 1e-4)
+        self.assertEqual(s["cost"]["unpriced"], 1)
+        self.assertIsNone(s["recordedCost"])
+
+    def test_recorded_cost(self):
+        projects = {"/home/me/repo": {"lastSessionId": SID, "lastCost": 1.5}, "/other": {"lastCost": 2}}
+        store.CONFIG_FILE.write_text(json.dumps({"projects": projects}), encoding="utf-8")
+        [s] = store.list_sessions()
+        self.assertEqual(s["recordedCost"], 1.5)
+
+    def test_reply_cost(self):
+        usage = {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 300,
+            "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+            "cache_read_input_tokens": 1000,
+            "output_tokens": 20,
+            "server_tool_use": {"web_search_requests": 2},
+        }
+        tokens = 10e-6 + 100 * 2e-6 + 200 * 4e-6 + 1000 * 1e-7 + 20 * 5e-6
+        self.assertAlmostEqual(store._reply_cost("claude-opus-5-5-20260101", usage), tokens + 0.02)
+        fast_us = {**usage, "speed": "fast", "inference_geo": "us"}
+        self.assertAlmostEqual(store._reply_cost("claude-opus-5-5", fast_us), tokens * 2.2 + 0.02)
+        self.assertIsNone(store._reply_cost("claude-unknown", usage))
+        # Above the tier's prompt length every token of the request takes the tier's rates.
+        tiered = {**PRICE, "tiers": [{"above": 1000, "input": 1e-3}]}
+        store.PRICE_LIST["models"]["claude-opus-5-5"] = tiered
+        self.assertAlmostEqual(store._reply_cost("claude-opus-5-5", usage), tokens + 10e-3 - 10e-6 + 0.02)
+        self.assertAlmostEqual(
+            store._reply_cost("claude-opus-5-5", {**usage, "cache_read_input_tokens": 0}),
+            tokens - 1e-4 + 0.02,
+        )
+
+    def test_extract_prices(self):
+        litellm = {
+            "claude-opus-5-5": {
+                "litellm_provider": "anthropic",
+                "input_cost_per_token": 1e-6,
+                "cache_creation_input_token_cost": 2e-6,
+                "cache_creation_input_token_cost_above_1hr": 4e-6,
+                "cache_read_input_token_cost": 1e-7,
+                "output_cost_per_token": 5e-6,
+                "input_cost_per_token_above_200k_tokens": 2e-6,
+                "input_cost_per_token_above_200k_tokens_batches": 1e-6,
+                "search_context_cost_per_query": {"search_context_size_medium": 0.01},
+                "provider_specific_entry": {"fast": 2, "us": "x"},
+            },
+            "claude-no-cache-price": {"litellm_provider": "anthropic", "input_cost_per_token": 1e-6},
+            "claude-on-bedrock": {"litellm_provider": "bedrock", "input_cost_per_token": 1e-6},
+            "gpt-x": {"litellm_provider": "openai"},
+        }
+        models = prices.extract(litellm)
+        self.assertEqual(list(models), ["claude-opus-5-5"])
+        self.assertEqual(
+            models["claude-opus-5-5"],
+            {
+                **RATES,
+                "webSearch": 0.01,
+                "multipliers": {"fast": 2},
+                "tiers": [{"above": 200000, "input": 2e-6}],
+            },
+        )
 
 
 class StoreTest(unittest.TestCase):

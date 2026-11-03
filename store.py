@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+# Claude Code's global config; it sits inside CLAUDE_CONFIG_DIR only when that is set.
+CONFIG_FILE = (CLAUDE_DIR if "CLAUDE_CONFIG_DIR" in os.environ else Path.home()) / ".claude.json"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 # Inside the Claude folder so the browser version, which only sees that folder, shares it.
 TRASH_DIR = Path(os.environ.get("CSM_TRASH_DIR", CLAUDE_DIR / ".csm-trash"))
@@ -58,6 +60,10 @@ REJECTED_RE = re.compile(
     r"|The server-side auto mode classifier)"
 )
 INTERRUPTED_RE = re.compile(r"\[Request interrupted by user")
+DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
+
+# The price list from prices.py ({"models": {...}}), set by serve.py; None prices nothing.
+PRICE_LIST = None
 
 _cache = {}  # path -> (mtime_ns, size, info)
 _lock = threading.Lock()
@@ -110,6 +116,40 @@ def _sum_counts(counts):
         for key in total:
             total[key] += c[key]
     return total
+
+
+def _int(mapping, key):
+    value = mapping.get(key) if isinstance(mapping, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _reply_cost(model, usage):
+    """US dollars for one API response at list price, or None when the model has no price."""
+    models = (PRICE_LIST or {}).get("models", {})
+    if not isinstance(model, str):
+        return None
+    price = models.get(model) or models.get(DATE_SUFFIX_RE.sub("", model))
+    if not price:
+        return None
+    write_1h = _int(usage.get("cache_creation"), "ephemeral_1h_input_tokens")
+    tokens = {
+        "input": _int(usage, "input_tokens"),
+        "cacheWrite5m": max(0, _int(usage, "cache_creation_input_tokens") - write_1h),
+        "cacheWrite1h": write_1h,
+        "cacheRead": _int(usage, "cache_read_input_tokens"),
+        "output": _int(usage, "output_tokens"),
+    }
+    prompt = sum(n for key, n in tokens.items() if key != "output")
+    rates = price
+    for tier in price["tiers"]:  # ascending; a long prompt makes every token of the request dearer
+        if prompt > tier["above"]:
+            rates = {**price, **tier}
+    multiplier = 1
+    for key in ("speed", "inference_geo"):
+        if isinstance(usage.get(key), str):
+            multiplier *= price["multipliers"].get(usage[key], 1)
+    searches = _int(usage.get("server_tool_use"), "web_search_requests")
+    return sum(n * rates[key] for key, n in tokens.items()) * multiplier + searches * price["webSearch"]
 
 
 def _tool_outcome(block, rec):
@@ -166,6 +206,12 @@ def _record_assistant(info, rec, response_ids, tool_calls):
     for key, field in USAGE_FIELDS.items():
         if isinstance(usage, dict) and isinstance(usage.get(field), int):
             info["usage"][key] += usage[field]
+    if real_model and isinstance(usage, dict):
+        cost = _reply_cost(model, usage)
+        if cost is None:
+            info["cost"]["unpriced"] += 1
+        else:
+            info["cost"]["usd"] += cost
 
 
 def _parse_meta(path):
@@ -184,6 +230,7 @@ def _parse_meta(path):
         "model": "",
         "effort": "",
         "usage": _empty_usage(),
+        "cost": {"usd": 0, "unpriced": 0},  # unpriced: replies whose model has no price
         "models": [],  # {model, effort, responses} in order of first use
         "compactions": {"manual": 0, "auto": 0},
     }
@@ -352,6 +399,7 @@ def _subagents(session_dir):
                 "lastActive": info["lastActive"],
                 "messages": info["userMessages"] + info["assistantMessages"],
                 "usage": info["usage"],
+                "cost": info["cost"],
                 "tools": info["tools"],
                 "models": info["models"],
                 "compactions": info["compactions"],
@@ -361,8 +409,24 @@ def _subagents(session_dir):
     return sorted(agents, key=lambda a: a["started"])
 
 
+def _recorded_costs():
+    """Claude Code's own cost of the last session in each project, by session id."""
+    try:
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    projects = config.get("projects") if isinstance(config, dict) else None
+    costs = {}
+    for project in projects.values() if isinstance(projects, dict) else []:
+        cost = project.get("lastCost") if isinstance(project, dict) else None
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            costs[project.get("lastSessionId")] = cost
+    return costs
+
+
 def list_sessions():
     sessions = []
+    recorded = _recorded_costs()
     with _lock:
         seen = set()
         for path in PROJECTS_DIR.glob("*/*.jsonl"):
@@ -390,6 +454,8 @@ def list_sessions():
                     "model": info["model"],
                     "effort": info["effort"],
                     "usage": _sum_counts([info["usage"], *(a["usage"] for a in subagents)]),
+                    "cost": _sum_counts([info["cost"], *(a["cost"] for a in subagents)]),
+                    "recordedCost": recorded.get(path.stem),
                     "tools": _sum_counts([info["tools"], *(a["tools"] for a in subagents)]),
                     "models": info["models"],
                     "compactions": _sum_counts([info["compactions"], *(a["compactions"] for a in subagents)]),

@@ -34,39 +34,65 @@ remembers the folder; later visits only ask you to confirm access again.
   folder upload picker: browse and read transcripts, no delete or trash.
 
 Nothing leaves the browser: the page's Content Security Policy only allows connections
-back to its own origin, and in this mode it makes none.
+back to its own origin, and the only thing it fetches from there is `prices.json`.
 
 ### GitHub Pages
 
 Every push to `main` (including merged pull requests) runs CI and, if it passes,
-publishes `static/` to GitHub Pages. One-time setup: **Settings → Pages → Build and
-deployment → Source: GitHub Actions**.
+publishes `static/` to GitHub Pages, with a fresh `prices.json` (see [Costs](#costs)). It
+also runs daily so prices follow the source list. One-time setup: **Settings → Pages →
+Build and deployment → Source: GitHub Actions**.
 
 ## What it does
 
 - Lists every session in `~/.claude/projects/*/*.jsonl`, with the AI title, first prompt,
   project, git branch, source (CLI / VS Code), last model and effort level, last activity,
-  message count, tokens and size. Tokens are summed over every API response in the session
-  and its subagents (input, cache write, cache read and output; hover for the breakdown).
+  message count, tokens, cost and size. Tokens are summed over every API response in the
+  session and its subagents (input, cache write, cache read and output; hover for the
+  breakdown). See [Costs](#costs) for where the dollar figure comes from.
   Subagent transcripts are shown nested under their parent session.
 - Click a session title (or a subagent) to read its transcript in a side panel: your
   prompts, Claude's replies, and each tool call with its input and result (collapsed;
   long outputs are cut at 8,000 characters). Thinking is stored encrypted, so it isn't shown.
 - **Resume** copies `cd '<cwd>' && claude --resume <id>` to the clipboard (a PowerShell
   equivalent on Windows).
-- **Details** opens a summary: messages, size, token consumption by type, and tool calls
+- **Details** opens a summary: messages, size, cost, token consumption by type, and tool calls
   by outcome (succeeded, errored, interrupted, rejected), split into session and subagents;
   how many times the conversation was compacted (`/compact` and automatic); and every
   model and effort level used, with the number of replies each.
   "Rejected" covers calls refused by you or by auto mode; "interrupted" includes calls that
   never got a result.
-- **Delete**: tick the checkbox on one or more rows (Shift+click selects a range, the
-  header box selects everything shown), then **Delete N sessions** above the table.
+- **Delete**: the trash icon on a row, or tick the checkbox on one or more rows (Shift+click
+  selects a range, the header box selects everything shown), then **Delete N sessions**
+  above the table; a progress bar follows a batch.
   Each session is moved to `~/.claude/.csm-trash/<id>/`: the transcript, its
   subagents/tool-results dir, `file-history/<id>`, `session-env/<id>` and any
-  `todos/<id>*.json`. The Trash tab can restore or permanently delete each session,
-  or **Empty trash** to delete them all. Both modes share this trash.
+  `todos/<id>*.json`. The Trash tab sorts by any column and can restore or permanently
+  delete each session, restore a selection the same way (**Restore N sessions**), or
+  **Empty trash** to delete them all. Both modes share this trash.
 - `~/.claude/history.jsonl` (your prompt history for the up-arrow key) is left untouched.
+
+## Costs
+
+Transcripts record tokens, not dollars, so a session's cost is one of two figures:
+
+- **Recorded by Claude Code**: Claude Code saves its own cost of the last session in each
+  project (`lastCost` in `~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`). It's used
+  when it is at least the transcript's cost; a lower figure only covers an earlier run. The
+  browser-only mode can read it only when that file is inside the folder you picked.
+- **At least, at list price**: every reply in the transcript and its subagents, priced per
+  model at the API's pay-as-you-go rates: input, 5-minute and 1-hour cache writes, cache
+  reads, output, web searches, the long-prompt tier, and the fast-mode and US-inference
+  multipliers. It's a lower bound: Claude Code makes some calls it doesn't write to the
+  transcript (titles, suggestions and the like), which put its own figure roughly 10% higher.
+
+Prices come from [LiteLLM's price list](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json),
+which is community-maintained (Anthropic publishes no pricing API). `prices.py` trims it to
+Anthropic's Claude models and writes `static/prices.json`: `serve.py` refreshes it at
+startup when it is over a day old, and the Pages workflow at every deploy. Without it,
+only costs recorded by Claude Code are shown; a model missing from the list isn't priced
+(the tooltip counts those replies). On a Pro or Max plan, or Bedrock, Vertex or negotiated
+pricing, list price isn't what you pay.
 
 ## Not supported
 
@@ -99,7 +125,14 @@ websites can't trigger deletes from your browser.
 ```bash
 python3 -m unittest discover -s tests   # smoke tests (stdlib only)
 uvx ruff check . && uvx ruff format .   # lint and format Python
+pre-commit install                      # run the hooks below on every commit
+pre-commit run --all-files              # or run them on demand
 ```
+
+The pre-commit hooks (`.pre-commit-config.yaml`) check for leaked credentials (Gitleaks,
+private keys), lint and format Python (Ruff), format JavaScript, CSS and HTML (Prettier), and
+lint them with ESLint, Stylelint and html-validate. The Node tools run in an environment
+pre-commit manages, so no `npm install` is needed.
 
 CI (`.github/workflows/ci.yml`) runs Ruff, a JavaScript syntax check, and the tests on
 Linux, macOS and Windows with Python 3.10 and 3.13 for every pull request. Dependabot
@@ -108,6 +141,7 @@ keeps the pinned GitHub Actions up to date.
 | File | Role |
 |---|---|
 | `serve.py`, `store.py` | local server and its file handling |
+| `prices.py` | downloads and trims the API price list into `static/prices.json` |
 | `static/index.html`, `styles.css`, `theme.js`, `app.js` | the UI, shared by both modes |
 | `static/backend-server.js` | data source: `serve.py`'s HTTP API |
 | `static/backend-browser.js`, `parser-worker.js` | data source: the browser reads `.claude` itself |

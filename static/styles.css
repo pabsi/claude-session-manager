@@ -1,6 +1,6 @@
 :root {
   --bg: #f7f6f3;
-  --surface: #ffffff;
+  --surface: #fff;
   --surface-2: #f1efea;
   --border: #e3e0d8;
   --text: #1f1e1c;
@@ -17,6 +17,7 @@
   --radius: 10px;
   --topbar-h: 59px;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
   color-scheme: light;
 }
 
@@ -36,6 +37,7 @@
   --vscode: #7fb3f5;
   --vscode-soft: #1d2b40;
   --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px rgb(0 0 0 / 0.35);
+
   color-scheme: dark;
 }
 
@@ -48,7 +50,12 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font:
+    14px/1.45 system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -68,7 +75,7 @@ a {
   width: 1px;
   height: 1px;
   overflow: hidden;
-  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
 }
 
 /* Top bar */
@@ -511,6 +518,16 @@ input[type="checkbox"] {
   cursor: progress;
 }
 
+.btn.icon {
+  display: inline-grid;
+  place-items: center;
+  padding: 6px 8px;
+}
+
+:root[data-readonly] .trash-btn {
+  display: none;
+}
+
 /* Selection */
 
 .grid tbody tr.selected {
@@ -545,6 +562,46 @@ input[type="checkbox"] {
   text-decoration: underline;
 }
 
+.batch-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.batch-progress[hidden] {
+  display: none;
+}
+
+.batch-progress progress {
+  flex: 1;
+  height: 8px;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+.batch-progress progress::-webkit-progress-bar {
+  background: var(--surface-2);
+}
+
+.batch-progress progress::-webkit-progress-value {
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+.batch-progress progress::-moz-progress-bar {
+  background: var(--accent);
+}
+
+.batch-progress span {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 :root[data-readonly] .select-col,
 :root[data-readonly] .select-cell {
   display: none;
@@ -577,7 +634,7 @@ input[type="checkbox"] {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   gap: 10px;
   margin: 0 0 20px;
 }
@@ -1095,9 +1152,8 @@ dialog.drawer[open] {
   padding: 10px 12px;
   background: var(--surface-2);
   border-radius: 8px;
-  overflow-x: auto;
+  overflow: auto;
   max-height: 420px;
-  overflow-y: auto;
   white-space: pre;
   tab-size: 4;
 }
@@ -1191,7 +1247,7 @@ dialog.drawer[open] {
   margin-left: auto;
 }
 
-.drawer-meta .badge:not(.cli):not(.vscode) {
+.drawer-meta .badge:not(.cli, .vscode) {
   background: var(--surface-2);
   color: var(--text);
 }
@@ -1285,6 +1341,7 @@ dialog p {
   main {
     padding: 14px 16px 40px;
   }
+
   /* Rows become cards. */
   .grid thead {
     display: none;
@@ -1302,6 +1359,7 @@ dialog p {
   }
 
   .grid tbody tr {
+    position: relative;
     display: grid;
     grid-template-columns: 1fr auto;
     gap: 4px 12px;
@@ -1310,10 +1368,6 @@ dialog p {
 
   .grid td {
     padding: 0;
-  }
-
-  .grid tbody tr {
-    position: relative;
   }
 
   .grid td.session-cell,
