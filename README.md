@@ -54,6 +54,10 @@ Build and deployment → Source: GitHub Actions**.
 - Click a session title (or a subagent) to read its transcript in a side panel: your
   prompts, Claude's replies, and each tool call with its input and result (collapsed;
   long outputs are cut at 8,000 characters). Thinking is stored encrypted, so it isn't shown.
+  Markdown in messages is rendered: headings, lists, tables, quotes, code and links.
+- **Export** (in the side panel of a session, not of a subagent) downloads the conversation as
+  one self-contained HTML file: the same layout, light or dark following the reader's system,
+  tool calls and thinking collapsed, and no scripts or external resources.
 - **Resume** copies `cd '<cwd>' && claude --resume <id>` to the clipboard (a PowerShell
   equivalent on Windows).
 - **Details** opens a summary: messages, size, cost, token consumption by type, and tool calls
@@ -143,6 +147,7 @@ keeps the pinned GitHub Actions up to date.
 | `serve.py`, `store.py` | local server and its file handling |
 | `prices.py` | downloads and trims the API price list into `static/prices.json` |
 | `static/index.html`, `styles.css`, `theme.js`, `app.js` | the UI, shared by both modes |
+| `static/markdown.js`, `transcript.css` | message rendering, shared by the side panel and HTML export |
 | `static/backend-server.js` | data source: `serve.py`'s HTTP API |
 | `static/backend-browser.js`, `parser-worker.js` | data source: the browser reads `.claude` itself |
 | `tests/test_smoke.py` | end-to-end checks of `store.py` and `serve.py` |

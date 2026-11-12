@@ -1,5 +1,6 @@
 import { connectServer } from "./backend-server.js";
 import * as local from "./backend-browser.js";
+import { renderMarkdown } from "./markdown.js";
 
 const LIVE_WINDOW_MS = 5 * 60 * 1000;
 const NAME_MAX = 64; // session names in the delete confirmation and details title
@@ -698,22 +699,8 @@ function openDetails(s) {
 
 // ---------- transcript viewer ----------
 
-const viewer = { sessionId: null };
-
-// Just enough markdown for chat text: fenced code, inline code, bold, links.
-function renderText(text) {
-  return text
-    .split(/```[^\n]*\n([\s\S]*?)(?:```|$)/)
-    .map((part, i) => {
-      if (i % 2) return `<pre class="code">${escapeHtml(part.replace(/\n$/, ""))}</pre>`;
-      const html = escapeHtml(part)
-        .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-        .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
-        .replace(/(https?:\/\/[^\s<)"']+)/g, `<a href="$1" target="_blank" rel="noopener">$1</a>`);
-      return html.trim() ? `<div class="text">${html}</div>` : "";
-    })
-    .join("");
-}
+// `messages` is set once the transcript has loaded; `agent` when it's a subagent's.
+const viewer = { sessionId: null, agent: null, messages: null };
 
 function toolHtml(b) {
   let status = "";
@@ -738,14 +725,14 @@ function toolHtml(b) {
 function blockHtml(b) {
   switch (b.type) {
     case "text":
-      return renderText(b.text);
+      return renderMarkdown(b.text);
     case "command":
       return `<div class="command">${escapeHtml(b.text)}</div>`;
     case "image":
       return `<div class="note">[image attached]</div>`;
     case "summary":
       return `<details class="fold">
-        <summary>Conversation summary (compacted)</summary>${renderText(b.text)}
+        <summary>Conversation summary (compacted)</summary>${renderMarkdown(b.text)}
       </details>`;
     case "thinking":
       return `<details class="fold">
@@ -770,6 +757,8 @@ function messageHtml(m) {
 
 async function openViewer(session, agent) {
   viewer.sessionId = session.id;
+  viewer.agent = agent ?? null;
+  viewer.messages = null;
   $("#viewer-title").textContent = agent
     ? agent.description || agent.agentId
     : session.title || session.firstPrompt || session.id;
@@ -780,7 +769,8 @@ async function openViewer(session, agent) {
        <span class="mono">${escapeHtml(shortPath(session.cwd))}</span>
        <span>${escapeHtml(absoluteTime(session.started))}</span>
        <span class="mono">${session.id}</span>`;
-  $("#viewer-resume").hidden = Boolean(agent);
+  $("#viewer-resume").hidden = $("#viewer-export").hidden = Boolean(agent);
+  $("#viewer-export").disabled = true;
   $("#viewer-tools").textContent = "Expand tools";
   $("#viewer-body").innerHTML = `<p class="empty">Loading…</p>`;
   if (!$("#viewer").open) $("#viewer").showModal();
@@ -788,13 +778,130 @@ async function openViewer(session, agent) {
 
   try {
     const { messages } = await backend.readTranscript(session.id, agent?.agentId);
-    if (viewer.sessionId !== session.id) return; // another transcript was opened meanwhile
+    // Another transcript was opened meanwhile.
+    if (viewer.sessionId !== session.id || viewer.agent !== (agent ?? null)) return;
+    viewer.messages = messages;
+    $("#viewer-export").disabled = !messages.length;
     $("#viewer-body").innerHTML = messages.length
       ? messages.map(messageHtml).join("")
       : `<p class="empty">No messages.</p>`;
   } catch (err) {
     $("#viewer-body").innerHTML = `<p class="empty">Failed to load: ${escapeHtml(err.message)}</p>`;
   }
+}
+
+// ---------- HTML export ----------
+
+// Page layout for the exported file; message styles come from transcript.css.
+const EXPORT_PAGE_CSS = `
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); }
+.page { max-width: 960px; margin: 0 auto; padding: 32px 20px 48px; }
+.page > header { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.page > header h1 { margin: 0 0 8px; font-size: 20px; overflow-wrap: anywhere; }
+.meta { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; color: var(--muted); font-size: 12.5px; }
+.meta .mono { font-family: var(--mono); font-size: 12px; }
+.messages { display: flex; flex-direction: column; gap: 14px; }
+.msg pre.code { max-height: none; }
+.page > footer { margin-top: 28px; color: var(--muted); font-size: 12px; text-align: center; }
+`;
+
+// A same-origin stylesheet's rules, by file name.
+function sheetRules(name) {
+  const sheet = [...document.styleSheets].find(
+    (s) => s.href && new URL(s.href).pathname.endsWith(`/${name}`),
+  );
+  return sheet ? [...sheet.cssRules] : [];
+}
+
+// The app's light and dark theme variables (dark follows the reader's system setting) and the
+// transcript styles, so the file looks like the side panel with nothing loaded from elsewhere.
+function exportCss() {
+  const app = sheetRules("styles.css");
+  const vars = (selector) => app.find((r) => r.selectorText === selector)?.style.cssText ?? "";
+  const transcript = sheetRules("transcript.css")
+    .map((r) => r.cssText)
+    .join("\n");
+  return `:root { ${vars(":root")} }
+@media (prefers-color-scheme: dark) { :root { ${vars(':root[data-theme="dark"]')} } }
+${EXPORT_PAGE_CSS}
+${transcript}`;
+}
+
+function exportHtml(session, messages) {
+  const title = session.title || session.firstPrompt || session.id;
+  const branch = session.gitBranch && session.gitBranch !== "HEAD" ? session.gitBranch : "";
+  const meta = [
+    sourceBadge(session),
+    session.cwd && `<span class="mono">${escapeHtml(shortPath(session.cwd))}</span>`,
+    branch && `<span class="mono">${escapeHtml(branch)}</span>`,
+    session.started && `<span>${escapeHtml(absoluteTime(session.started))}</span>`,
+    `<span>${plural(messages.length, "message")}</span>`,
+    `<span class="mono">${escapeHtml(session.id)}</span>`,
+  ].filter(Boolean);
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">
+<meta name="generator" content="Claude Sessions Manager">
+<title>${escapeHtml(crop(title, 120))}</title>
+<style>
+${exportCss()}
+</style>
+</head>
+<body>
+<div class="page">
+<header>
+<h1>${escapeHtml(title)}</h1>
+<div class="meta">${meta.join("\n")}</div>
+</header>
+<main class="messages">
+${messages.map(messageHtml).join("\n")}
+</main>
+<footer>Exported ${escapeHtml(dtf.format(new Date()))} from Claude Sessions Manager</footer>
+</div>
+</body>
+</html>
+`;
+}
+
+// "Fix the login bug" -> "fix-the-login-bug-1a2b3c4d.html"
+function exportFileName(session) {
+  const slug = (session.title || session.firstPrompt || "")
+    .normalize("NFKD")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "-")
+    .slice(0, 60)
+    .replace(/-+$/, "");
+  return `${slug || "session"}-${session.id.slice(0, 8)}.html`;
+}
+
+function downloadFile(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = Object.assign(document.createElement("a"), { href: url, download: name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+function exportTranscript() {
+  const session = findSession(viewer.sessionId);
+  if (!session || viewer.agent || !viewer.messages?.length) return;
+  const name = exportFileName(session);
+  downloadFile(name, exportHtml(session, viewer.messages), "text/html;charset=utf-8");
+  toast(`Exported <code>${escapeHtml(name)}</code>`);
 }
 
 // ---------- actions ----------
@@ -954,7 +1061,10 @@ for (const dlg of [$("#viewer"), $("#details")]) {
     if (e.target === e.currentTarget) e.currentTarget.close(); // click on the backdrop
   });
 }
-$("#viewer").addEventListener("close", () => (viewer.sessionId = null));
+$("#viewer").addEventListener("close", () => {
+  viewer.sessionId = viewer.agent = viewer.messages = null;
+});
+$("#viewer-export").addEventListener("click", exportTranscript);
 $("#viewer-resume").addEventListener("click", () => actions.resume(viewer.sessionId));
 $("#viewer-bottom").addEventListener("click", () => {
   const body = $("#viewer-body");
