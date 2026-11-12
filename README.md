@@ -140,7 +140,10 @@ pre-commit manages, so no `npm install` is needed.
 
 CI (`.github/workflows/ci.yml`) runs Ruff, a JavaScript syntax check, and the tests on
 Linux, macOS and Windows with Python 3.10 and 3.13 for every pull request. Dependabot
-keeps the pinned GitHub Actions up to date.
+keeps the pinned GitHub Actions up to date, and `dependabot-auto-merge.yml` approves and
+squash-merges its `chore(deps)` pull requests once CI passes on them, then redeploys Pages.
+This needs **Settings → Actions → General → Allow GitHub Actions to create and approve pull
+requests**.
 
 | File | Role |
 |---|---|
