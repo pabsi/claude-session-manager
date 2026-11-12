@@ -1,0 +1,46 @@
+name: Dependabot auto-merge
+
+# Approves and squash-merges Dependabot's "chore(deps)" pull requests once CI passes on them.
+# Needs Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests".
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # Opened by Dependabot from a branch in this repo. Not github.actor: it is the last actor on the
+    # PR, not its author, so it can be spoofed (https://docs.zizmor.sh/audits/#bot-conditions).
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.title, 'chore(deps)')
+    uses: $/.github/workflows/ci.yml
+
+  merge:
+    needs: ci
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # merge and delete the branch
+      pull-requests: write # approve
+      actions: write # start the Pages deploy
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Approve
+        run: gh pr review "$PR_URL" --repo "$GITHUB_REPOSITORY" --approve --body "Dependabot update, CI passed."
+      - name: Merge
+        # Only the commit CI just tested: a newer push to the branch makes this fail.
+        run: gh pr merge "$PR_URL" --repo "$GITHUB_REPOSITORY" --squash --delete-branch --match-head-commit "$HEAD_SHA"
+      - name: Deploy GitHub Pages
+        # A merge made with GITHUB_TOKEN doesn't trigger push workflows, so start the deploy here.
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main
