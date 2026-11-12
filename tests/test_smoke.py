@@ -279,8 +279,17 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(res.status, 403, "mutations need the X-CSM header")
         res, _ = self.request("GET", "/api/sessions", {"Host": "evil.example"})
         self.assertEqual(res.status, 403, "unknown Host header")
-        res, _ = self.request("GET", "/../store.py")
-        self.assertEqual(res.status, 404, "no files outside static/")
+        for path in (
+            "/../store.py",
+            "/..%2Fstore.py",
+            "//etc/passwd",
+            "/%2e%2e/serve.py",
+            "/C:/Windows/win.ini",
+        ):
+            res, _ = self.request("GET", path)
+            self.assertEqual(res.status, 404, f"no files outside static/: {path}")
+        res, _ = self.request("GET", "/markdown.js")
+        self.assertEqual(res.status, 200, "files in static/ are served")
 
 
 if __name__ == "__main__":

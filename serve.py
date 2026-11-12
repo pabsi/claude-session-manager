@@ -58,6 +58,19 @@ ROUTES = [
 ]
 
 
+def _static_files():
+    """Every file in static/ by URL path ("/app.js"), read fresh so new files are found.
+
+    Requests are looked up here, so a request path never reaches the filesystem, and
+    symlinks that lead out of static/ are left out.
+    """
+    return {
+        "/" + path.relative_to(STATIC_DIR).as_posix(): path
+        for path in STATIC_DIR.rglob("*")
+        if path.is_file() and path.resolve().is_relative_to(STATIC_DIR)
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "claude-sessions-manager"
 
@@ -121,9 +134,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(HTTPStatus.OK, result if result is not None else {"ok": True})
 
     def _static(self, path):
-        rel = "index.html" if path == "/" else path.lstrip("/")
-        target = (STATIC_DIR / rel).resolve()
-        if not target.is_relative_to(STATIC_DIR) or not target.is_file():
+        target = _static_files().get("/index.html" if path == "/" else path)
+        if target is None:
             return self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
         ctype = CONTENT_TYPES.get(target.suffix, "application/octet-stream")
         self._send(HTTPStatus.OK, target.read_bytes(), ctype, cache="no-cache")
