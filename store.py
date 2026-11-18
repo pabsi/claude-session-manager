@@ -11,6 +11,7 @@ import re
 import shutil
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
@@ -20,6 +21,11 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 # Inside the Claude folder so the browser version, which only sees that folder, shares it.
 TRASH_DIR = Path(os.environ.get("CSM_TRASH_DIR", CLAUDE_DIR / ".csm-trash"))
 LEGACY_TRASH_DIR = Path.home() / ".local/share/claude-sessions-manager/trash"
+# Names given in this app, {session id: name}; also inside the Claude folder for the browser.
+NAMES_FILE = CLAUDE_DIR / ".csm-names.json"
+NAME_MAX = 200  # the cap Claude Code's /rename applies
+# Control, format (zero-width, bidi) and line/paragraph separators: replaced by spaces.
+INVISIBLE_CATEGORIES = ("Cc", "Cf", "Zl", "Zp")
 
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -67,6 +73,7 @@ PRICE_LIST = None
 
 _cache = {}  # path -> (mtime_ns, size, info)
 _lock = threading.Lock()
+_names_lock = threading.Lock()
 
 
 # ---------- parsing ----------
@@ -427,6 +434,7 @@ def _recorded_costs():
 def list_sessions():
     sessions = []
     recorded = _recorded_costs()
+    names = _read_names()
     with _lock:
         seen = set()
         for path in PROJECTS_DIR.glob("*/*.jsonl"):
@@ -439,10 +447,13 @@ def list_sessions():
                 continue
             session_dir = path.with_suffix("")
             subagents = _subagents(session_dir)
+            original = info["customTitle"] or info["title"]  # /rename's name, else Claude Code's title
             sessions.append(
                 {
                     "id": path.stem,
-                    "title": info["customTitle"] or info["title"],
+                    "title": names.get(path.stem) or original,
+                    "name": names.get(path.stem, ""),
+                    "originalTitle": original,
                     "firstPrompt": info["firstPrompt"],
                     "cwd": info["cwd"],
                     "project": path.parent.name,
@@ -499,6 +510,71 @@ def read_transcript(sid, agent_id=None):
         else:
             messages.append({"role": rec["type"], "ts": rec.get("timestamp", ""), "blocks": blocks})
     return {"messages": messages}
+
+
+# ---------- names ----------
+
+
+def _read_names(strict=False):
+    """{session id: name} from NAMES_FILE. With strict, a file that exists but can't be used
+    raises instead of reading as empty, so a write never replaces names it couldn't read."""
+    try:
+        data = json.loads(NAMES_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        if strict:
+            raise ValueError(f"can't read {NAMES_FILE.name} ({exc}); fix or delete it") from exc
+        return {}
+    if not isinstance(data, dict):
+        if strict:
+            raise ValueError(f"{NAMES_FILE.name} isn't a JSON object; fix or delete it")
+        return {}
+    return {k: v for k, v in data.items() if SESSION_ID_RE.match(k) and isinstance(v, str) and v}
+
+
+def _write_names(names):
+    tmp = NAMES_FILE.with_name(NAMES_FILE.name + ".tmp")
+    tmp.write_text(
+        json.dumps(dict(sorted(names.items())), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp, NAMES_FILE)  # atomic, so a crash never leaves half a file
+
+
+def clean_name(name):
+    """One line of at most NAME_MAX characters, invisible characters replaced by spaces."""
+    if not isinstance(name, str):
+        raise ValueError("name must be a string")
+    visible = "".join(" " if unicodedata.category(c) in INVISIBLE_CATEGORIES else c for c in name)
+    return " ".join(visible.split())[:NAME_MAX].rstrip()
+
+
+def rename_session(sid, name):
+    """Name a session in this app; an empty name removes it, so the original title shows again."""
+    if not SESSION_ID_RE.match(sid):
+        raise ValueError("invalid session id")
+    name = clean_name(name)
+    if not _find_transcript(sid):
+        raise FileNotFoundError(sid)
+    with _names_lock:
+        names = _read_names(strict=True)
+        if name:
+            names[sid] = name
+        elif names.pop(sid, None) is None:
+            return {"id": sid, "name": ""}
+        _write_names(names)
+    return {"id": sid, "name": name}
+
+
+def _forget_names(sids):
+    """Drop the names of permanently deleted sessions; leaves an unreadable file alone."""
+    with _names_lock:
+        try:
+            names = _read_names(strict=True)
+        except ValueError:
+            return
+        if any(names.pop(sid, None) is not None for sid in list(sids)):
+            _write_names(names)
 
 
 # ---------- trash ----------
@@ -558,12 +634,15 @@ def trash_session(sid):
 
 def list_trash():
     entries = []
+    names = _read_names()
     for manifest_path in TRASH_DIR.glob("*/manifest.json"):
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except ValueError:
             continue
         manifest["size"] = _dir_size(manifest_path.parent)
+        if name := names.get(manifest.get("id")):
+            manifest["title"] = name
         entries.append(manifest)
     return sorted(entries, key=lambda m: m.get("trashedAt", ""), reverse=True)
 
@@ -600,12 +679,14 @@ def restore_session(sid):
 
 def purge_session(sid):
     shutil.rmtree(_trash_entry(sid))
+    _forget_names([sid])
 
 
 def empty_trash():
     entries = [m.parent for m in TRASH_DIR.glob("*/manifest.json")]
     for entry in entries:
         shutil.rmtree(entry)
+    _forget_names(entry.name for entry in entries)
     return {"deleted": len(entries)}
 
 

@@ -30,6 +30,7 @@ CONTENT_TYPES = {
     ".png": "image/png",
 }
 PLATFORM = {"win32": "windows", "darwin": "mac"}.get(sys.platform, "linux")
+BODY_MAX = 4096  # request bodies are small JSON objects
 
 
 def _info():
@@ -41,20 +42,26 @@ def _info():
     }
 
 
+# Each action gets the regex match and the request's JSON body (None without one).
 ROUTES = [
-    ("GET", re.compile(r"^/api/info$"), lambda m: _info()),
-    ("GET", re.compile(r"^/api/sessions$"), lambda m: store.list_sessions()),
-    ("GET", re.compile(r"^/api/sessions/([^/]+)/transcript$"), lambda m: store.read_transcript(m[1])),
+    ("GET", re.compile(r"^/api/info$"), lambda m, _: _info()),
+    ("GET", re.compile(r"^/api/sessions$"), lambda m, _: store.list_sessions()),
+    ("GET", re.compile(r"^/api/sessions/([^/]+)/transcript$"), lambda m, _: store.read_transcript(m[1])),
     (
         "GET",
         re.compile(r"^/api/sessions/([^/]+)/subagents/([^/]+)/transcript$"),
-        lambda m: store.read_transcript(m[1], m[2]),
+        lambda m, _: store.read_transcript(m[1], m[2]),
     ),
-    ("GET", re.compile(r"^/api/trash$"), lambda m: store.list_trash()),
-    ("DELETE", re.compile(r"^/api/trash$"), lambda m: store.empty_trash()),
-    ("POST", re.compile(r"^/api/sessions/([^/]+)/trash$"), lambda m: store.trash_session(m[1])),
-    ("POST", re.compile(r"^/api/trash/([^/]+)/restore$"), lambda m: store.restore_session(m[1])),
-    ("DELETE", re.compile(r"^/api/trash/([^/]+)$"), lambda m: store.purge_session(m[1])),
+    ("GET", re.compile(r"^/api/trash$"), lambda m, _: store.list_trash()),
+    ("DELETE", re.compile(r"^/api/trash$"), lambda m, _: store.empty_trash()),
+    ("POST", re.compile(r"^/api/sessions/([^/]+)/trash$"), lambda m, _: store.trash_session(m[1])),
+    ("POST", re.compile(r"^/api/trash/([^/]+)/restore$"), lambda m, _: store.restore_session(m[1])),
+    ("DELETE", re.compile(r"^/api/trash/([^/]+)$"), lambda m, _: store.purge_session(m[1])),
+    (
+        "PUT",
+        re.compile(r"^/api/sessions/([^/]+)/name$"),
+        lambda m, body: store.rename_session(m[1], body.get("name") if isinstance(body, dict) else None),
+    ),
 ]
 
 
@@ -117,9 +124,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._run(action, match)
         return self._json(HTTPStatus.NOT_FOUND, {"error": "no such endpoint"})
 
+    def _body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 <= length <= BODY_MAX:
+            raise ValueError("bad request body length")
+        return json.loads(self.rfile.read(length)) if length else None
+
     def _run(self, action, match):
         try:
-            result = action(match)
+            result = action(match, self._body())
         except ValueError as exc:
             return self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except FileNotFoundError as exc:
@@ -140,7 +153,7 @@ class Handler(BaseHTTPRequestHandler):
         ctype = CONTENT_TYPES.get(target.suffix, "application/octet-stream")
         self._send(HTTPStatus.OK, target.read_bytes(), ctype, cache="no-cache")
 
-    do_GET = do_HEAD = do_POST = do_DELETE = _dispatch
+    do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = _dispatch
 
 
 def main():

@@ -195,6 +195,7 @@ class StoreTest(unittest.TestCase):
     def tearDown(self):
         for entry in store.list_trash():
             store.purge_session(entry["id"])
+        store.NAMES_FILE.unlink(missing_ok=True)
 
     def test_list_sessions(self):
         [s] = store.list_sessions()
@@ -231,6 +232,40 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(store.empty_trash(), {"deleted": 1})
         self.assertEqual(store.list_trash(), [])
 
+    def test_rename(self):
+        self.assertEqual(store.rename_session(SID, "  My\u200b name\n "), {"id": SID, "name": "My name"})
+        [s] = store.list_sessions()
+        self.assertEqual((s["title"], s["name"], s["originalTitle"]), ("My name", "My name", "Bug fix"))
+        self.assertEqual(json.loads(store.NAMES_FILE.read_text(encoding="utf-8")), {SID: "My name"})
+        self.assertEqual(len(store.rename_session(SID, "x" * 300)["name"]), store.NAME_MAX)
+        store.rename_session(SID, "")
+        [s] = store.list_sessions()
+        self.assertEqual((s["title"], s["name"]), ("Bug fix", ""))
+        self.assertEqual(json.loads(store.NAMES_FILE.read_text(encoding="utf-8")), {})
+
+    def test_rename_guards(self):
+        with self.assertRaises(ValueError):
+            store.rename_session("../x", "a")
+        with self.assertRaises(ValueError):
+            store.rename_session(SID, 42)
+        with self.assertRaises(FileNotFoundError):
+            store.rename_session("00000000-0000-0000-0000-000000000000", "a")
+        store.NAMES_FILE.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError, msg="never overwrites a file it can't read"):
+            store.rename_session(SID, "a")
+        self.assertEqual(store.NAMES_FILE.read_text(encoding="utf-8"), "{not json")
+        self.assertEqual(store.list_sessions()[0]["title"], "Bug fix", "listing ignores it")
+
+    def test_purge_forgets_name(self):
+        store.rename_session(SID, "Keep me")
+        store.trash_session(SID)
+        self.assertEqual(store.list_trash()[0]["title"], "Keep me")
+        store.restore_session(SID)
+        self.assertEqual(store.list_sessions()[0]["title"], "Keep me")
+        store.trash_session(SID)
+        store.purge_session(SID)
+        self.assertEqual(json.loads(store.NAMES_FILE.read_text(encoding="utf-8")), {})
+
     def test_rejects_bad_ids(self):
         for bad in ("../x", "x" * 36):
             with self.assertRaises(ValueError):
@@ -252,9 +287,9 @@ class ServerTest(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
-    def request(self, method, path, headers=None):
+    def request(self, method, path, headers=None, body=None):
         conn = http.client.HTTPConnection(serve.HOST, self.port)
-        conn.request(method, path, headers=headers or {})
+        conn.request(method, path, body=body, headers=headers or {})
         res = conn.getresponse()
         body = res.read()
         conn.close()
@@ -273,6 +308,21 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(json.loads(body)[0]["id"], SID)
         res, body = self.request("GET", "/api/info")
         self.assertIn(json.loads(body)["platform"], ("linux", "mac", "windows"))
+
+    def test_rename(self):
+        path, csm = f"/api/sessions/{SID}/name", {"X-CSM": "1", "Content-Type": "application/json"}
+        try:
+            res, body = self.request("PUT", path, csm, json.dumps({"name": "Via API"}))
+            self.assertEqual((res.status, json.loads(body)["name"]), (200, "Via API"))
+            _, body = self.request("GET", "/api/sessions")
+            self.assertEqual(json.loads(body)[0]["title"], "Via API")
+            res, _ = self.request("PUT", path, {"Content-Type": "application/json"}, '{"name": "x"}')
+            self.assertEqual(res.status, 403, "needs the X-CSM header")
+            for bad in ("not json", '{"name": 1}', json.dumps({"name": "x" * 5000})):
+                res, _ = self.request("PUT", path, csm, bad)
+                self.assertEqual(res.status, 400, bad[:20])
+        finally:
+            store.NAMES_FILE.unlink(missing_ok=True)
 
     def test_guards(self):
         res, _ = self.request("POST", f"/api/sessions/{SID}/trash")

@@ -60,6 +60,11 @@ Build and deployment → Source: GitHub Actions**.
   tool calls and thinking collapsed, and no scripts or external resources.
 - **Resume** copies `cd '<cwd>' && claude --resume <id>` to the clipboard (a PowerShell
   equivalent on Windows).
+- **Rename**: the pencil next to a session's title (Enter saves, Esc cancels, an empty name
+  brings back the original title). Names are saved in `~/.claude/.csm-names.json`, shared by
+  both modes, and shown instead of the title Claude Code gave the session or set with its
+  `/rename` command; transcripts aren't changed. Firefox and Safari open the folder
+  read-only, so there the names are shown but can't be changed.
 - **Details** opens a summary: messages, size, cost, token consumption by type, and tool calls
   by outcome (succeeded, errored, interrupted, rejected), split into session and subagents;
   how many times the conversation was compacted (`/compact` and automatic); and every

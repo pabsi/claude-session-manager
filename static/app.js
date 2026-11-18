@@ -28,6 +28,11 @@ const TRASH_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden=
   <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.7 9.5h6.6L12 4M6.75 7v4M9.25 7v4"/>
 </svg>`;
 
+const PENCIL_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none"
+  stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M11 2.5l2.5 2.5L5.5 13 2.5 13.5 3 10.5z M9.5 4l2.5 2.5"/>
+</svg>`;
+
 let backend = null;
 
 const state = {
@@ -46,6 +51,7 @@ const state = {
     trash: { selected: new Set(), visibleIds: [], anchorId: null },
   },
   progress: null, // { done, total, label, view } while a batch runs
+  editing: null, // { id, value, fresh } while a session's name is being edited
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -277,7 +283,16 @@ function renderProjects() {
 }
 
 function searchText(s) {
-  s._search ??= [s.title, s.firstPrompt, s.cwd, s.gitBranch, s.id, formatModel(s.model), s.effort]
+  s._search ??= [
+    s.title,
+    s.originalTitle,
+    s.firstPrompt,
+    s.cwd,
+    s.gitBranch,
+    s.id,
+    formatModel(s.model),
+    s.effort,
+  ]
     .concat(s.subagents.map((a) => a.description))
     .join(" ")
     .toLowerCase();
@@ -333,6 +348,28 @@ function subagentsHtml(agents) {
   </details>`;
 }
 
+// Firefox and Safari open the folder read-only, so the button is shown but can't be used.
+function renameButton(s) {
+  if (!backend.writable) {
+    return `<button type="button" class="rename-btn" aria-disabled="true" aria-label="Rename (unavailable)"
+      title="Renaming needs Chrome or Edge: this browser opens the folder read-only">${PENCIL_ICON}</button>`;
+  }
+  const hint = s.name ? `Rename (original: ${s.originalTitle || s.firstPrompt || "none"})` : "Rename";
+  return `<button type="button" class="rename-btn" data-action="rename" aria-label="Rename"
+    title="${escapeHtml(hint)}">${PENCIL_ICON}</button>`;
+}
+
+function titleHtml(s, title) {
+  if (state.editing?.id !== s.id) {
+    return `<a href="#" class="title link" data-action="view" title="View transcript">${escapeHtml(title)}</a>
+      ${renameButton(s)}`;
+  }
+  const original = s.originalTitle || s.firstPrompt || "";
+  return `<input type="text" class="rename-input" aria-label="Session name"
+    value="${escapeHtml(state.editing.value)}" placeholder="${escapeHtml(original || "Session name")}"
+    title="Enter to save · Esc to cancel · leave empty to show the original title">`;
+}
+
 function sessionRow(s) {
   const title = s.title || s.firstPrompt || "(no prompt)";
   const prompt =
@@ -353,7 +390,7 @@ function sessionRow(s) {
       <input type="checkbox" class="row-select" aria-label="Select session"${selected ? " checked" : ""}>
     </td>
     <td class="session-cell">
-      <a href="#" class="title link" data-action="view" title="View transcript">${escapeHtml(title)}</a>
+      <div class="title-line">${titleHtml(s, title)}</div>
       ${prompt}
       <div class="sid">${s.id}</div>
       ${subagentsHtml(s.subagents)}
@@ -407,12 +444,20 @@ function trashRow(t) {
   </tr>`;
 }
 
+let rendering = false;
+
 function render() {
   const rows = filteredSessions();
   selection("sessions").visibleIds = rows.map((s) => s.id);
   const trash = sortedTrash();
   selection("trash").visibleIds = trash.map((t) => t.id);
-  $("#rows").innerHTML = rows.map(sessionRow).join("");
+  rendering = true; // replacing the rows blurs a name being edited; that isn't a save
+  try {
+    $("#rows").innerHTML = rows.map(sessionRow).join("");
+  } finally {
+    rendering = false;
+  }
+  focusRenameInput();
   $("#empty").hidden = rows.length > 0;
   syncSelection();
   $("#trash-rows").innerHTML = trash.map(trashRow).join("");
@@ -576,7 +621,7 @@ async function trashSessions(chosen, button) {
   const label = (done, total) => `Moved ${done} of ${total} to trash…`;
   const failed = await runBatch(chosen, button, label, async (s) => {
     const manifest = await backend.trashSession(s.id);
-    state.trash.unshift({ ...manifest, size: s.size });
+    state.trash.unshift({ ...manifest, title: s.name || manifest.title, size: s.size });
     state.sessions = state.sessions.filter((x) => x.id !== s.id);
     selection("sessions").selected.delete(s.id);
   });
@@ -599,6 +644,43 @@ async function restoreSessions(chosen, button) {
   if (failed.length) toast(`Restored ${restored}. Failed: ${escapeHtml(failed.join("; "))}`, true);
   else toast(`Restored ${plural(restored, "session")}`);
   await load();
+}
+
+// ---------- rename ----------
+
+function focusRenameInput() {
+  const input = $("#rows .rename-input");
+  if (!input || document.activeElement === input) return;
+  input.focus();
+  if (state.editing.fresh) input.select();
+  else input.setSelectionRange(input.value.length, input.value.length);
+  state.editing.fresh = false;
+}
+
+function cancelRename() {
+  state.editing = null;
+  render();
+}
+
+// Saves the edited name in the Claude folder; an empty name brings back the original title.
+async function saveRename() {
+  const editing = state.editing;
+  if (!editing) return;
+  state.editing = null;
+  const s = findSession(editing.id);
+  const value = editing.value.trim();
+  render();
+  if (!s || value === (s.name || s.title || "")) return;
+  try {
+    const { name } = await backend.renameSession(s.id, value);
+    s.name = name;
+    s.title = name || s.originalTitle;
+    s._search = undefined;
+    render();
+    toast(name ? `Renamed to “${escapeHtml(name)}”` : "Name removed; showing the original title");
+  } catch (err) {
+    toast(escapeHtml(err.message), true);
+  }
 }
 
 // ---------- details ----------
@@ -942,6 +1024,12 @@ const actions = {
     openDetails(findSession(id));
   },
 
+  rename(id) {
+    const s = findSession(id);
+    state.editing = { id, value: s.name || s.title || "", fresh: true };
+    render();
+  },
+
   trash(id, button) {
     return trashSessions([findSession(id)], button);
   },
@@ -1049,6 +1137,23 @@ for (const { rows, all } of Object.values(SELECTABLE)) {
     syncSelection();
   });
 }
+$("#rows").addEventListener("input", (e) => {
+  if (e.target.matches(".rename-input")) state.editing.value = e.target.value;
+});
+$("#rows").addEventListener("keydown", (e) => {
+  if (!e.target.matches(".rename-input")) return;
+  if (e.key === "Enter") {
+    e.preventDefault();
+    saveRename();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation();
+    cancelRename();
+  }
+});
+$("#rows").addEventListener("focusout", (e) => {
+  if (e.target.matches(".rename-input") && !rendering) saveRename();
+});
 $("#bulk-action").addEventListener("click", bulkAction);
 $("#clear-selection").addEventListener("click", clearSelection);
 $("#theme-toggle").addEventListener("click", toggleTheme);

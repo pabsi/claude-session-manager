@@ -1239,3 +1239,72 @@ dialog p {
     padding: 14px 12px;
   }
 }
+
+/* Rename */
+
+.title-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.rename-btn {
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+  padding: 3px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0;
+}
+
+.grid tbody tr:hover .rename-btn,
+.rename-btn:focus-visible {
+  opacity: 1;
+}
+
+.rename-btn:hover {
+  color: var(--accent);
+  background: var(--surface-2);
+}
+
+/* Read-only folder (Firefox, Safari): visible on hover but dimmed and not usable. */
+.rename-btn[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+.grid tbody tr:hover .rename-btn[aria-disabled="true"] {
+  opacity: 0.45;
+}
+
+.rename-btn[aria-disabled="true"]:hover {
+  color: var(--muted);
+  background: none;
+}
+
+.rename-input {
+  width: 100%;
+  max-width: 70ch;
+  font: inherit;
+  font-weight: 600;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+@media (hover: none) {
+  .rename-btn {
+    opacity: 1;
+  }
+
+  .rename-btn[aria-disabled="true"] {
+    opacity: 0.45;
+  }
+}

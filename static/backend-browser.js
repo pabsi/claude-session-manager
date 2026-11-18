@@ -6,6 +6,10 @@ const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const HOME_RE = /^(\/home\/[^/]+|\/Users\/[^/]+|[A-Za-z]:\\Users\\[^\\]+)/;
 const TRASH = ".csm-trash";
+const NAMES = ".csm-names.json"; // {session id: name} given in this app, shared with serve.py
+const NAME_MAX = 200; // the cap Claude Code's /rename applies
+// Control, format (zero-width, bidi) and line/paragraph separators: replaced by spaces.
+const INVISIBLE_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
 const CACHE_KEY = "meta-cache-v5"; // bump when parseMeta's output changes
 
 export const canWrite = typeof window.showDirectoryPicker === "function";
@@ -242,6 +246,13 @@ function checkId(id, re = SESSION_ID_RE) {
   if (!re.test(id)) throw new Error("invalid id");
 }
 
+// One line of at most NAME_MAX characters (code points, as in Python), invisible ones as spaces.
+function cleanName(name) {
+  if (typeof name !== "string") throw new Error("name must be a string");
+  const words = name.replace(INVISIBLE_RE, " ").split(/\s+/).filter(Boolean);
+  return Array.from(words.join(" ")).slice(0, NAME_MAX).join("").trimEnd();
+}
+
 // ---------- backend ----------
 
 function createBackend(fs) {
@@ -342,6 +353,38 @@ function createBackend(fs) {
     return candidates.filter((_, i) => kinds[i]);
   }
 
+  // {session id: name}. With strict, a file that exists but can't be used throws instead of
+  // reading as empty, so a write never replaces names it couldn't read.
+  async function readNames(strict = false) {
+    let data;
+    try {
+      data = JSON.parse(await (await fs.file(NAMES)).text());
+    } catch (err) {
+      if (!strict || isMissing(err)) return {};
+      throw new Error(`can't read ${NAMES} (${err.message}); fix or delete it`, { cause: err });
+    }
+    if (!isObject(data)) {
+      if (strict) throw new Error(`${NAMES} isn't a JSON object; fix or delete it`);
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(data).filter(([id, name]) => SESSION_ID_RE.test(id) && typeof name === "string" && name),
+    );
+  }
+
+  async function writeNames(names) {
+    const sorted = Object.fromEntries(Object.entries(names).sort(([a], [b]) => a.localeCompare(b)));
+    await fs.writeText(NAMES, JSON.stringify(sorted, null, 2) + "\n");
+  }
+
+  // Drop the names of permanently deleted sessions; leaves an unreadable file alone.
+  async function forgetNames(ids) {
+    const names = await readNames(true).catch(() => null);
+    if (!names || !ids.some((id) => id in names)) return;
+    for (const id of ids) delete names[id];
+    await writeNames(names);
+  }
+
   async function readManifest(id) {
     return JSON.parse(await (await fs.file(`${TRASH}/${id}/manifest.json`)).text());
   }
@@ -376,13 +419,14 @@ function createBackend(fs) {
         }),
       );
       const files = await Promise.all(found.map((f) => fs.file(f.path)));
-      const [infos, recorded, list] = await Promise.all([
+      const [infos, recorded, list, names] = await Promise.all([
         metaFor(
           found.map((f) => f.path),
           files,
         ),
         recordedCosts(),
         loadPrices(),
+        readNames(),
       ]);
       backend.prices = list && { source: list.source, fetched: list.fetched };
 
@@ -394,9 +438,12 @@ function createBackend(fs) {
           if (!(info.userMessages || info.assistantMessages)) return null;
           const sessionDir = f.path.replace(/\.jsonl$/, "");
           const [dirSize, agents] = await Promise.all([treeSize(fs, sessionDir), subagents(sessionDir)]);
+          const original = info.customTitle || info.title; // /rename's name, else Claude Code's title
           return {
             id: f.id,
-            title: info.customTitle || info.title,
+            title: names[f.id] || original,
+            name: names[f.id] || "",
+            originalTitle: original,
             firstPrompt: info.firstPrompt,
             cwd: info.cwd,
             project: f.project,
@@ -440,6 +487,7 @@ function createBackend(fs) {
     },
 
     async listTrash() {
+      const names = await readNames();
       const entries = await Promise.all(
         (await fs.list(TRASH))
           .filter((e) => e.kind === "directory")
@@ -447,6 +495,7 @@ function createBackend(fs) {
             try {
               const manifest = await readManifest(e.name);
               manifest.size = await treeSize(fs, `${TRASH}/${e.name}`);
+              if (names[manifest.id]) manifest.title = names[manifest.id];
               return manifest;
             } catch {
               return null; // not a trash entry
@@ -454,6 +503,20 @@ function createBackend(fs) {
           }),
       );
       return entries.filter(Boolean).sort((a, b) => (b.trashedAt || "").localeCompare(a.trashedAt || ""));
+    },
+
+    // Name a session in this app; an empty name removes it, so the original title shows again.
+    async renameSession(id, name) {
+      checkId(id);
+      if (!fs.writable) throw new Error("this folder is open read-only");
+      name = cleanName(name);
+      await findTranscript(id);
+      const names = await readNames(true);
+      if (name) names[id] = name;
+      else if (id in names) delete names[id];
+      else return { id, name };
+      await writeNames(names);
+      return { id, name };
     },
 
     async trashSession(id) {
@@ -506,11 +569,13 @@ function createBackend(fs) {
       checkId(id);
       await readManifest(id); // only delete real trash entries
       await fs.remove(`${TRASH}/${id}`);
+      await forgetNames([id]);
     },
 
     async emptyTrash() {
       const entries = await backend.listTrash();
       for (const e of entries) await fs.remove(`${TRASH}/${e.id}`);
+      await forgetNames(entries.map((e) => e.id));
       return { deleted: entries.length };
     },
   };
